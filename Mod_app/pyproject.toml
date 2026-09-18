@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "game-asset-explorer"
+version = "0.22.1"
+description = "Read-only cross-game character asset discovery with an embedded 3D viewer"
+requires-python = ">=3.11"
+dependencies = ["Pillow>=10"]
+license = {text = "GPL-3.0-or-later"}
+
+[project.scripts]
+game-assets = "game_asset_explorer.cli:main"
+
+[project.optional-dependencies]
+rpf3 = ["pycryptodome>=3.19"]
+unity = ["UnityPy>=1.20,<2"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["game_asset_explorer*"]
