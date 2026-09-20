@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import math
 import struct
 import unittest
 import uuid
 
 from game_asset_explorer.frostbite_ebx import (
-    decode_anthem_skeleton, inspect_anthem_ebx_record, parse_anthem_ebx_header,
+    _rotation_matrix_to_quaternion, decode_anthem_skeleton,
+    decode_anthem_skeleton_bind_rotations, inspect_anthem_ebx_record,
+    parse_anthem_ebx_header,
 )
 from game_asset_explorer.geometry import MeshFormatError
 
@@ -76,6 +79,24 @@ class FrostbiteEbxTests(unittest.TestCase):
 
         self.assertEqual(skeleton.joints[0], ("Root", -1, 0.0, 0.0, 0.0))
         self.assertEqual(skeleton.joints[1], ("Child", 0, 1.0, 0.0, 0.0))
+
+        rotations = decode_anthem_skeleton_bind_rotations(bytes(raw))
+        self.assertEqual(len(rotations), 2)
+        for x, y, z, w in rotations:
+            self.assertAlmostEqual(x * x + y * y + z * z + w * w, 1.0, places=5)
+            # every candidate array here uses an identity rotation submatrix
+            self.assertAlmostEqual(w, 1.0, places=5)
+
+    def test_rotation_matrix_to_quaternion_round_trips_a_known_rotation(self) -> None:
+        # A 90 degree rotation around Z: x'=-y, y'=x, z'=z (row-major).
+        rotation_90z = (0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+        x, y, z, w = _rotation_matrix_to_quaternion(rotation_90z)
+        self.assertAlmostEqual(x * x + y * y + z * z + w * w, 1.0, places=5)
+        angle_deg = math.degrees(2 * math.acos(min(1.0, abs(w))))
+        self.assertAlmostEqual(angle_deg, 90.0, places=2)
+        self.assertAlmostEqual(z, math.copysign(math.sin(math.radians(45)), z), places=5)
+        self.assertAlmostEqual(x, 0.0, places=5)
+        self.assertAlmostEqual(y, 0.0, places=5)
 
 
 if __name__ == "__main__":

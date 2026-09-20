@@ -57,11 +57,19 @@ class App(tk.Tk):
         self._frostbite_skeleton_cache = {}
         self._preview_character: dict[str, object] | None = None
         self._active_character: dict[str, object] | None = None
+        self._active_animation: dict[str, object] | None = None
+        self._animation_after_id: str | None = None
+        self._animation_start_time: float | None = None
+        self._last_animation_phase: float = 0.0
+        self._animation_playback: dict[str, object] | None = None
         self.use_for_animation_var = tk.BooleanVar(value=False)
         self.active_character_var = tk.StringVar(value="No active character")
         self.animation_clip_var = tk.StringVar(value="Animation: none selected")
         self.animation_state_var = tk.StringVar(value="Select an animation record to inspect it.")
         self.animation_loop_var = tk.BooleanVar(value=True)
+        self.animation_filter_unhealthy_var = tk.BooleanVar(value=True)
+        self.animation_group_var = tk.StringVar()
+        self._animation_group_options: list[dict[str, object]] = []
         self.animation_speed_var = tk.StringVar(value="1.0×")
         self._build()
 
@@ -125,10 +133,32 @@ class App(tk.Tk):
             state="disabled",
         )
         self.animation_stop_button.pack(side="left", padx=4)
-        ttk.Checkbutton(
+        self.animation_dump_button = ttk.Button(
+            self.animation_bar, text="Dump pose debug…", command=self._dump_animation_pose_debug,
+            state="disabled",
+        )
+        self.animation_dump_button.pack(side="left", padx=4)
+        self.animation_health_button = ttk.Button(
+            self.animation_bar, text="Channel health…", command=self._dump_animation_channel_health,
+            state="disabled",
+        )
+        self.animation_health_button.pack(side="left", padx=4)
+        self.animation_loop_checkbox = ttk.Checkbutton(
             self.animation_bar, text="Loop", variable=self.animation_loop_var,
             state="disabled",
-        ).pack(side="left", padx=4)
+        )
+        self.animation_loop_checkbox.pack(side="left", padx=4)
+        self.animation_filter_checkbox = ttk.Checkbutton(
+            self.animation_bar, text="Skip flagged channels", variable=self.animation_filter_unhealthy_var,
+            state="disabled",
+        )
+        self.animation_filter_checkbox.pack(side="left", padx=4)
+        self.animation_group_combo = ttk.Combobox(
+            self.animation_bar, textvariable=self.animation_group_var,
+            state="disabled", width=22,
+        )
+        self.animation_group_combo.pack(side="left", padx=4)
+        self.animation_group_combo.bind("<<ComboboxSelected>>", self._on_animation_group_selected)
         ttk.Label(self.animation_bar, textvariable=self.animation_speed_var).pack(
             side="left", padx=4,
         )
@@ -192,8 +222,18 @@ class App(tk.Tk):
 
     @staticmethod
     def _javelin_family(asset) -> str | None:
+        """Despite the name (kept for compatibility), this now infers a
+        general character/creature family, not just Javelins -- see
+        _infer_character_family for why the naming convention generalizes.
+        Only searches directory segments, not the filename itself -- a
+        filename's own first underscore-separated word (e.g. "ast" in
+        "ast_exm_sentinel_idle...") would otherwise be found after, and so
+        override, the real family folder (e.g. "exm") when only the last
+        match is kept.
+        """
         value = (asset.internal_path or asset.relative_path).replace("\\", "/").casefold()
-        matches = re.findall(r"(?:^|/)(ex[a-z])(?=_|/)", value)
+        directory = (value.rsplit("/", 1)[0] if "/" in value else "") + "/"
+        matches = re.findall(r"(?:^|/)([a-z]{2,8})(?=_|/)", directory)
         specific = [family for family in matches if family != "exo"]
         return specific[-1] if specific else None
 
@@ -266,11 +306,154 @@ class App(tk.Tk):
             return f"{clip_family} mismatch", False
         return "compatibility unknown", None
 
+    def _on_animation_group_selected(self, _event=None) -> None:
+        index = self.animation_group_combo.current()
+        if index < 0 or index >= len(self._animation_group_options):
+            return
+        option = self._animation_group_options[index]
+        active = self._active_character
+        if active is None:
+            return
+        from .frostbite_animation_channels import analyze_quaternion_channel_health, format_channel_health_summary
+        from .frostbite_animation_playback import guess_bone_mapping
+        real_q = option["channels"]
+        mapping = guess_bone_mapping(active["skeleton"], len(real_q), active.get("primary_rig_order"))
+        health = analyze_quaternion_channel_health(real_q, mapping, active["skeleton"])
+        name = self._active_animation["name"] if self._active_animation else "animation"
+        self._active_animation = {
+            "channels": real_q,
+            "mapping": mapping,
+            "name": name,
+            "health": health,
+        }
+        self._animation_playback = None  # stale mapping from the previous group; rebuilt on next Play
+        self.animation_dump_button.configure(state="normal")
+        self.animation_health_button.configure(state="normal")
+        self.status_var.set(
+            f"Switched to {option['label']} -- {format_channel_health_summary(health)}. Press Play to preview."
+        )
+
     def _play_active_animation(self) -> None:
-        self.status_var.set("This control unlocks when the selected Frostbite clip keyframes are decoded.")
+        animation = self._active_animation
+        character = self._active_character
+        if animation is None or character is None:
+            self.status_var.set("This control unlocks when the selected Frostbite clip keyframes are decoded.")
+            return
+        mapping, channels = animation["mapping"], animation["channels"]
+        filtering_note = ""
+        if self.animation_filter_unhealthy_var.get() and animation.get("health"):
+            from .frostbite_animation_playback import filter_healthy_channels
+            mapping, channels = filter_healthy_channels(mapping, channels, animation["health"])
+            skipped = len(animation["mapping"]) - len(mapping)
+            if skipped:
+                filtering_note = f" ({skipped} flagged channel(s) skipped)"
+        self._animation_playback = {
+            "skeleton": character["skeleton"],
+            "bind_rotations": character.get("bind_rotations") or [],
+            "mapping": mapping,
+            "channels": channels,
+            "loop_seconds": 3.0,
+        }
+        self._animation_start_time = self._clock()
+        self.animation_play_button.configure(state="disabled")
+        self.animation_stop_button.configure(state="normal")
+        self.status_var.set(
+            f"Playing {animation['name']}{filtering_note} · bone mapping is a best guess, watch for obviously wrong bones."
+        )
+        self._animation_tick()
 
     def _stop_active_animation(self) -> None:
+        if self._animation_after_id is not None:
+            self.after_cancel(self._animation_after_id)
+            self._animation_after_id = None
+        self._animation_start_time = None
+        self.animation_play_button.configure(state="normal" if self._active_animation else "disabled")
+        self.animation_stop_button.configure(state="disabled")
         self._show_active_character()
+
+    @staticmethod
+    def _clock() -> float:
+        import time
+        return time.monotonic()
+
+    def _animation_tick(self) -> None:
+        playback = getattr(self, "_animation_playback", None)
+        if playback is None or self._animation_start_time is None:
+            return
+        from .frostbite_animation_playback import evaluate_pose
+        elapsed = self._clock() - self._animation_start_time
+        loop_seconds = playback["loop_seconds"]
+        if not self.animation_loop_var.get() and elapsed >= loop_seconds:
+            self._stop_active_animation()
+            return
+        phase = (elapsed % loop_seconds) / loop_seconds
+        self._last_animation_phase = phase
+        pose = evaluate_pose(playback["skeleton"], playback["bind_rotations"], playback["mapping"], playback["channels"], phase)
+        self.viewer.set_mesh_skeleton(pose)
+        self._animation_after_id = self.after(33, self._animation_tick)
+
+    def _dump_animation_pose_debug(self) -> None:
+        animation = self._active_animation
+        character = self._active_character
+        if animation is None or character is None:
+            self.status_var.set("Nothing to dump yet -- select a compatible animation with a character loaded first.")
+            return
+        from datetime import datetime
+        from pathlib import Path
+        from .frostbite_animation_playback import describe_pose_debug, format_pose_debug
+        phase = self._last_animation_phase
+        # Prefer the mapping/channels actually used for the last Play (which
+        # respects the "Skip flagged channels" toggle) so this reflects what
+        # was really rendered, not always the full unfiltered set.
+        playback = getattr(self, "_animation_playback", None)
+        mapping = playback["mapping"] if playback else animation["mapping"]
+        channels = playback["channels"] if playback else animation["channels"]
+        records = describe_pose_debug(
+            character["skeleton"], character.get("bind_rotations") or [],
+            mapping, channels, phase,
+        )
+        text = format_pose_debug(records, phase)
+        text = (
+            f"Character: {character.get('name', '?')}\n"
+            f"Animation: {animation.get('name', '?')}\n"
+            f"Total joints: {len(character['skeleton'].joints)}, "
+            f"channels available: {len(channels)}"
+            f"{' (filtered to healthy only)' if playback and len(channels) < len(animation['channels']) else ''}\n\n"
+        ) + text
+        try:
+            out_dir = Path.home() / "Desktop"
+            if not out_dir.is_dir():
+                out_dir = Path.cwd()
+            out_path = out_dir / f"pose_debug_{datetime.now():%Y%m%d_%H%M%S}.txt"
+            out_path.write_text(text, encoding="utf-8")
+        except OSError as error:
+            self.status_var.set(f"Could not write pose debug file: {error}")
+            return
+        self.status_var.set(f"Wrote pose debug snapshot (phase={phase:.3f}) to {out_path}")
+
+    def _dump_animation_channel_health(self) -> None:
+        animation = self._active_animation
+        if animation is None:
+            self.status_var.set("Nothing to check yet -- select a compatible animation with a character loaded first.")
+            return
+        health = animation.get("health")
+        if not health:
+            self.status_var.set("No channel health data available for this clip.")
+            return
+        from datetime import datetime
+        from pathlib import Path
+        from .frostbite_animation_channels import format_channel_health_report, format_channel_health_summary
+        text = f"Animation: {animation.get('name', '?')}\n\n" + format_channel_health_report(health)
+        try:
+            out_dir = Path.home() / "Desktop"
+            if not out_dir.is_dir():
+                out_dir = Path.cwd()
+            out_path = out_dir / f"channel_health_{datetime.now():%Y%m%d_%H%M%S}.txt"
+            out_path.write_text(text, encoding="utf-8")
+        except OSError as error:
+            self.status_var.set(f"Could not write channel health file: {error}")
+            return
+        self.status_var.set(f"Wrote channel health report ({format_channel_health_summary(health)}) to {out_path}")
 
     def start_scan(self) -> None:
         entered = self.path_var.get().strip()
@@ -857,10 +1040,46 @@ class App(tk.Tk):
                         info.update(inspect_anthem_ebx_record(raw))
                     except MeshFormatError as error:
                         info["inspection_error"] = str(error)
+                elif asset.metadata.get("record_kind") == "res":
+                    from .frostbite_state import is_antstate_resource
+                    if is_antstate_resource(raw):
+                        from .frostbite_animation_channels import analyze_channel_group, find_channel_array_headers
+                        from .frostbite_animation_playback import guess_bone_mapping
+                        groups = find_channel_array_headers(raw)
+                        group_options = []
+                        for group_index, headers in enumerate(groups):
+                            report = analyze_channel_group(raw, headers)
+                            real_q = [c for c in report.quaternion_channels if not c.is_degenerate]
+                            if not real_q:
+                                continue
+                            reference = real_q[0]
+                            time_span = max(reference.times) - min(reference.times) if reference.times else 0
+                            group_options.append({
+                                "index": group_index, "report": report, "channels": real_q,
+                                "label": f"Group {group_index} ({len(real_q)} ch, span {time_span})",
+                            })
+                        if group_options:
+                            # Default to the group with the most channels, same as before.
+                            best = max(group_options, key=lambda option: len(option["channels"]))
+                            info["_animation_group_options"] = group_options
+                            info["_animation_group_default_index"] = group_options.index(best)
+                            real_q = best["channels"]
+                            info["quaternion_channel_count"] = len(real_q)
+                            active = self._active_character
+                            if active is not None and real_q:
+                                mapping = guess_bone_mapping(
+                                    active["skeleton"], len(real_q), active.get("primary_rig_order"),
+                                )
+                                from .frostbite_animation_channels import analyze_quaternion_channel_health, format_channel_health_summary
+                                health = analyze_quaternion_channel_health(real_q, mapping, active["skeleton"])
+                                info["_playback_channels"] = real_q
+                                info["_playback_mapping"] = mapping
+                                info["_channel_health"] = health
+                                info["channel_health_summary"] = format_channel_health_summary(health)
                 self.after(0, self._show_frostbite_animation_record, asset, title, info)
                 return
             if asset.metadata.get("reader") == "frostbite-skeleton-record":
-                skeleton = self._decode_frostbite_skeleton_asset(asset)
+                skeleton, _bind_rotations, _primary_rig_order = self._decode_frostbite_skeleton_asset(asset)
                 self.after(0, self.viewer.set_skeleton, skeleton, title)
                 self.after(
                     0, self.status_var.set,
@@ -881,15 +1100,18 @@ class App(tk.Tk):
                     return
                 _kind, meshes, lod_index, decoded_name, available_lods, rig_diagnostic = preview
                 skeleton = None
+                bind_rotations = None
+                primary_rig_order = None
                 skeleton_error = None
                 try:
                     self.after(0, self.status_var.set, "Resolving the matching Javelin bind skeleton…")
-                    skeleton = self._decode_matching_frostbite_skeleton(asset)
+                    skeleton, bind_rotations, primary_rig_order = self._decode_matching_frostbite_skeleton(asset)
                 except (MeshFormatError, OSError, RuntimeError, ValueError) as error:
                     skeleton_error = str(error)
                 self.after(
                     0, self._show_frostbite_preview, asset, meshes, lod_index,
-                    decoded_name, available_lods, rig_diagnostic, skeleton, skeleton_error,
+                    decoded_name, available_lods, rig_diagnostic, skeleton, skeleton_error, bind_rotations,
+                    primary_rig_order,
                 )
                 return
             if asset.extension == ".meshset" and not asset.internal_path:
@@ -1003,6 +1225,7 @@ class App(tk.Tk):
             self.after(0, self.preview_button.configure, {"state": "normal"})
 
     def _show_frostbite_animation_record(self, asset, title: str, info: dict[str, object]) -> None:
+        self._animation_playback = None
         compatibility, compatible = self._animation_compatibility(asset)
         if self._active_character is not None:
             self._show_active_character()
@@ -1021,24 +1244,62 @@ class App(tk.Tk):
                 f"EBX loaded: {int(info.get('imports', 0))} imports, "
                 f"{int(info.get('arrays', 0))} arrays"
             )
+        elif "quaternion_channel_count" in info:
+            structure = f"{kind} payload loaded, {info['quaternion_channel_count']} rotation channels decoded"
+            if "channel_health_summary" in info:
+                structure += f" ({info['channel_health_summary']})"
         else:
             structure = f"{kind} payload loaded ({int(info.get('bytes', 0)):,} bytes)"
+
+        has_decoded_channels = "_playback_channels" in info and "_playback_mapping" in info
+        playback_ready = has_decoded_channels and self._active_character is not None and compatible is not False
         if compatible is False:
             state = "Different Javelin family; playback remains disabled."
         elif self._active_character is None:
             state = "No active character; playback remains disabled."
+        elif not has_decoded_channels:
+            if "quaternion_channel_count" in info:
+                state = "No active character bones matched this clip's channels; playback remains disabled."
+            else:
+                state = "This isn't a decodable AntState animation payload; playback remains disabled."
         else:
-            state = "Record inspected; compressed animation keyframes are not decoded yet."
+            self._active_animation = {
+                "channels": info["_playback_channels"],
+                "mapping": info["_playback_mapping"],
+                "name": display_name,
+                "health": info.get("_channel_health"),
+            }
+            state = (
+                f"{len(info['_playback_channels'])} rotation channels ready -- "
+                "bone mapping is a best guess, refine by eye once playing."
+            )
+        if not playback_ready:
+            self._active_animation = None
         self.animation_state_var.set(state)
-        self.animation_play_button.configure(state="disabled")
+        self.animation_play_button.configure(state="normal" if playback_ready else "disabled")
         self.animation_stop_button.configure(state="disabled")
+        self.animation_dump_button.configure(state="normal" if playback_ready else "disabled")
+        self.animation_health_button.configure(state="normal" if playback_ready else "disabled")
+        self.animation_loop_checkbox.configure(state="normal" if playback_ready else "disabled")
+        self.animation_filter_checkbox.configure(state="normal" if playback_ready else "disabled")
+        group_options = info.get("_animation_group_options") or []
+        if playback_ready and len(group_options) > 1:
+            self._animation_group_options = group_options
+            self.animation_group_combo.configure(state="readonly", values=[g["label"] for g in group_options])
+            default_index = int(info.get("_animation_group_default_index", 0))
+            self.animation_group_combo.current(default_index)
+        else:
+            self._animation_group_options = group_options if playback_ready else []
+            self.animation_group_combo.configure(state="disabled", values=[])
+            self.animation_group_var.set("")
         self._update_animation_bar()
         self.status_var.set(f"{structure}. {state}")
 
     def _show_frostbite_preview(
         self, asset, meshes, lod_index: int, decoded_name: str,
         available_lods: list[int], rig_diagnostic: dict[str, object] | str,
-        skeleton=None, skeleton_error: str | None = None,
+        skeleton=None, skeleton_error: str | None = None, bind_rotations=None,
+        primary_rig_order=None,
     ) -> None:
         asset.metadata["available_lods"] = list(available_lods)
         asset.metadata["lod0_available"] = 0 in available_lods
@@ -1086,6 +1347,8 @@ class App(tk.Tk):
                         "family": self._javelin_family(asset),
                         "meshes": meshes,
                         "skeleton": skeleton,
+                        "bind_rotations": bind_rotations or [],
+                        "primary_rig_order": primary_rig_order,
                         "lod": lod_index,
                         "available_lods": list(available_lods),
                         "rig_report": self._rig_report,
@@ -1131,17 +1394,46 @@ class App(tk.Tk):
             + detail_message + " " + summary + skeleton_message
         )
 
+    def _infer_character_family(self, internal_path: str) -> str | None:
+        """Return the short lowercase prefix (e.g. 'exm', 'ara', 'sox') that
+        names this asset's character/creature family, if any.
+
+        Originally only matched Javelin codes (ex[a-z]). Generalized after
+        confirming, across real scanned data, that the SAME
+        "{family}/{family}_master_skeleton.ebx" (or "{family}_skeleton.ebx")
+        convention is used for dozens of non-Javelin families too (ara, dml,
+        dsr, glm, sox, wrap, cla, and many more) -- it's a general Anthem
+        convention, not something specific to Javelins.
+
+        Only searches directory segments, not the filename itself, for the
+        same reason as _javelin_family: a filename's own leading word could
+        otherwise be mistaken for the family.
+        """
+        internal = internal_path.replace("\\", "/").lower()
+        directory = (internal.rsplit("/", 1)[0] if "/" in internal else "") + "/"
+        match = re.search(r"(?:^|/)([a-z]{2,8})_[^/]+(?:/|$)", directory)
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _candidate_skeleton_filenames(family: str) -> list[str]:
+        """Both observed naming conventions, most specific first."""
+        return [f"{family}_master_skeleton.ebx", f"{family}_skeleton.ebx"]
+
     def _matching_master_skeleton_asset(self, mesh_asset):
         internal = (mesh_asset.internal_path or "").replace("\\", "/").lower()
-        match = re.search(r"(?:^|/)(ex[a-z])_[^/]+(?:/|$)", internal)
-        if not match or not self.result:
+        family = self._infer_character_family(internal)
+        if not family or not self.result:
             return None
-        expected = f"{match.group(1)}_master_skeleton.ebx"
-        return next((
-            candidate for candidate in self.result.assets
-            if candidate.metadata.get("reader") == "frostbite-skeleton-record"
-            and (candidate.internal_path or "").replace("\\", "/").lower().endswith("/" + expected)
-        ), None)
+        expected_names = self._candidate_skeleton_filenames(family)
+        for expected in expected_names:
+            match = next((
+                candidate for candidate in self.result.assets
+                if candidate.metadata.get("reader") == "frostbite-skeleton-record"
+                and (candidate.internal_path or "").replace("\\", "/").lower().endswith("/" + expected)
+            ), None)
+            if match is not None:
+                return match
+        return None
 
     def _decode_frostbite_skeleton_asset(self, skeleton_asset):
         key = (skeleton_asset.internal_path or skeleton_asset.relative_path).casefold()
@@ -1151,7 +1443,10 @@ class App(tk.Tk):
         if not self.result:
             raise MeshFormatError("Scan data is no longer available.")
         from .frostbite import extract_frostbite_record_dependencies_isolated
-        from .frostbite_ebx import decode_anthem_skeleton
+        from .frostbite_ebx import (
+            decode_anthem_primary_rig_joint_order, decode_anthem_skeleton,
+            decode_anthem_skeleton_bind_rotations,
+        )
         primary, dependencies = extract_frostbite_record_dependencies_isolated(
             self.result.engine_root or self.result.root, skeleton_asset,
         )
@@ -1161,8 +1456,17 @@ class App(tk.Tk):
         for candidate_name, raw in attempts:
             try:
                 skeleton = decode_anthem_skeleton(raw, str(candidate_name))
-                self._frostbite_skeleton_cache[key] = skeleton
-                return skeleton
+                try:
+                    bind_rotations = decode_anthem_skeleton_bind_rotations(raw)
+                except MeshFormatError:
+                    bind_rotations = []  # positions decoded fine; rotations unavailable, fall back to identity
+                try:
+                    primary_rig_order = decode_anthem_primary_rig_joint_order(raw)
+                except MeshFormatError:
+                    primary_rig_order = None
+                result = (skeleton, bind_rotations, primary_rig_order)
+                self._frostbite_skeleton_cache[key] = result
+                return result
             except MeshFormatError as error:
                 errors.append(str(error))
         raise MeshFormatError("The linked EBX was found but is not a decoded SkeletonAsset: " + errors[-1])
@@ -1174,22 +1478,26 @@ class App(tk.Tk):
         return self._decode_frostbite_skeleton_asset(candidate)
 
     def _matching_master_skeleton(self, asset) -> str:
-        """Return the indexed master-skeleton path suggested by a Javelin prefix."""
+        """Return the indexed master-skeleton path suggested by the asset's
+        inferred character/creature family (see _infer_character_family)."""
         internal = (asset.internal_path or "").replace("\\", "/").lower()
-        match = re.search(r"(?:^|/)(ex[a-z])_[^/]+(?:/|$)", internal)
-        if not match:
-            return "No Javelin skeleton family could be inferred from this mesh name."
-        family = match.group(1)
-        expected = f"{family}_master_skeleton.ebx"
+        family = self._infer_character_family(internal)
+        if not family:
+            return "No character/creature family could be inferred from this mesh name."
+        expected_names = self._candidate_skeleton_filenames(family)
         if self.result:
-            for candidate in self.result.assets:
-                candidate_path = (candidate.internal_path or "").replace("\\", "/").lower()
-                if (
-                    candidate.metadata.get("reader") == "frostbite-skeleton-record"
-                    and candidate_path.endswith("/" + expected)
-                ):
-                    return f"Indexed skeleton candidate: {candidate.internal_path}"
-        return f"Expected skeleton candidate: animation/{family}/{expected} (not indexed in the current result set)"
+            for expected in expected_names:
+                for candidate in self.result.assets:
+                    candidate_path = (candidate.internal_path or "").replace("\\", "/").lower()
+                    if (
+                        candidate.metadata.get("reader") == "frostbite-skeleton-record"
+                        and candidate_path.endswith("/" + expected)
+                    ):
+                        return f"Indexed skeleton candidate: {candidate.internal_path}"
+        return (
+            f"Expected skeleton candidate: animation/{family}/{expected_names[0]} "
+            "(not indexed in the current result set)"
+        )
 
     def show_rig_inspector(self) -> None:
         """Show decoded skin inputs without claiming the skeleton is bound yet."""
@@ -1283,14 +1591,17 @@ class App(tk.Tk):
                 return
             _kind, meshes, decoded_lod, decoded_name, available_lods, rig_diagnostic = preview
             skeleton = None
+            bind_rotations = None
+            primary_rig_order = None
             skeleton_error = None
             try:
-                skeleton = self._decode_matching_frostbite_skeleton(asset)
+                skeleton, bind_rotations, primary_rig_order = self._decode_matching_frostbite_skeleton(asset)
             except (MeshFormatError, OSError, RuntimeError, ValueError) as error:
                 skeleton_error = str(error)
             self.after(
                 0, self._show_frostbite_preview, asset, meshes, decoded_lod,
-                decoded_name, available_lods, rig_diagnostic, skeleton, skeleton_error,
+                decoded_name, available_lods, rig_diagnostic, skeleton, skeleton_error, bind_rotations,
+                primary_rig_order,
             )
         except Exception as error:
             self.after(0, self._finish_frostbite_lod_error, str(error))
