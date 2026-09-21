@@ -3,9 +3,38 @@ import unittest
 
 from game_asset_explorer.grouping import (
     asset_folder_key, asset_in_physical_scope, asset_in_virtual_scope,
-    folder_rows, items_in_folder, parse_virtual_location,
+    category_for_asset, folder_rows, items_in_folder, parse_virtual_location,
 )
 from game_asset_explorer.models import AssetRecord, CharacterBundle
+
+
+class CategoryForAssetTests(unittest.TestCase):
+    def _asset(self, kind: str, extension: str = ".res") -> AssetRecord:
+        return AssetRecord(
+            path=Path("Anthem/Data/default.sb"),
+            relative_path=f"Data/default.sb::some/path/file{extension}",
+            kind=kind,
+            extension=extension,
+            size=100,
+            engine="Frostbite",
+            directly_viewable=False,
+        )
+
+    def test_other_kind_routes_to_its_own_category_not_meshes(self) -> None:
+        # Regression guard: references that don't match any known naming
+        # pattern (e.g. a likely-texture .res file with no naming hint --
+        # confirmed on real Anthem data that textures aren't named
+        # helpfully, same as meshes/animations/skeletons before them) used
+        # to be silently dropped entirely. Now they get kind="other" and
+        # must land in a dedicated category, not get mixed into
+        # "Characters / meshes" via the generic fallback.
+        asset = self._asset("other")
+        self.assertEqual(category_for_asset(asset), "Other / unclassified")
+
+    def test_known_kinds_are_unaffected_by_the_other_routing(self) -> None:
+        self.assertEqual(category_for_asset(self._asset("animation")), "Animations")
+        self.assertEqual(category_for_asset(self._asset("skeleton")), "Skeletons")
+        self.assertEqual(category_for_asset(self._asset("texture")), "Textures")
 
 
 class FolderRowsTests(unittest.TestCase):

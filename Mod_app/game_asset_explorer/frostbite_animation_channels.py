@@ -1,4 +1,10 @@
-"""Decode EclipseAnimationFloatChannel / EclipseAnimationVectorChannel /
+"""Legacy experimental channel reader retained for regression comparison.
+
+The GUI no longer calls this module. Its heuristic group search and signed
+Euler interpretation were disproved by the bounded Eclipse decoder in
+``frostbite_animation.py``. Do not use this module for Anthem playback.
+
+Decode EclipseAnimationFloatChannel / EclipseAnimationVectorChannel /
 EclipseAnimationQuaternionChannel keyframe data out of an already-decoded
 Anthem AntState resource (see frostbite_state.py for the container format
 this sits inside).

@@ -782,6 +782,135 @@ def extract_frostbite_record(root: Path, asset: AssetRecord) -> bytes:
     )
 
 
+def resolve_frostbite_virtual_asset_key(
+    root: Path, asset: AssetRecord, key: bytes, *, max_records: int = 50_000,
+) -> tuple[AssetRecord | None, bytes | None, int, bool]:
+    """Resolve an eight-byte Gameplay Data virtual-asset key across RES files.
+
+    Anthem's BankPointer names are authored object labels, not archive paths.
+    Their SubjectBankAsset fields therefore have to be matched against decoded
+    GD.DATA resources. The owning bundle and Javelin-family bundles are searched
+    first, then the remaining installation metadata. The returned boolean says
+    whether the search was exhaustive rather than stopped by ``max_records``.
+    """
+    if len(key) != 8:
+        raise MeshFormatError("A Gameplay Data virtual-asset key must be exactly eight bytes.")
+    if max_records <= 0:
+        raise MeshFormatError("The virtual-asset search limit must be positive.")
+
+    from .frostbite_animation import has_gd_data_asset_key
+    from .frostbite_state import is_antstate_resource
+
+    layout = load_layout_map(root)
+    oodle = OodleDecoder(find_oodle_runtime(root))
+    current_key = (asset.path.resolve(), int(asset.metadata.get("bundle_offset", -1)))
+    family = ""
+    normalized_source = (asset.internal_path or "").replace("\\", "/").casefold()
+    source_parts = [part for part in normalized_source.split("/") if part]
+    if "animation" in source_parts:
+        family_index = source_parts.index("animation") + 1
+        if family_index < len(source_parts):
+            family = source_parts[family_index]
+
+    references: list[tuple[str, Path, int]] = []
+    seen_bundle_refs: set[tuple[Path, int]] = set()
+    if current_key[1] >= 0:
+        references.append((str(asset.metadata.get("bundle_name", "")), asset.path, current_key[1]))
+        seen_bundle_refs.add(current_key)
+    for toc_path in _toc_paths(layout):
+        try:
+            for name, sb_path, offset in iter_toc_bundle_refs(layout, toc_path):
+                reference_key = (sb_path.resolve(), offset)
+                if reference_key in seen_bundle_refs:
+                    continue
+                seen_bundle_refs.add(reference_key)
+                references.append((name, sb_path, offset))
+        except (FrostbiteIndexError, OSError):
+            continue
+
+    def priority(reference: tuple[str, Path, int]) -> tuple[int, str, int]:
+        name, path, offset = reference
+        folded = name.replace("\\", "/").casefold()
+        if (path.resolve(), offset) == current_key:
+            rank = 0
+        elif family and any(part == family for part in folded.split("/")):
+            rank = 1
+        elif family and family in folded:
+            rank = 2
+        elif "animation" in folded or "/anim" in folded:
+            rank = 3
+        else:
+            rank = 4
+        return rank, folded, offset
+
+    references.sort(key=priority)
+    source_sha1 = str(asset.metadata.get("sha1", "")).casefold()
+    seen_records: set[tuple[bytes, str]] = set()
+    scanned = 0
+    exhaustive = True
+    for bundle_name, sb_path, bundle_offset in references:
+        try:
+            bundle = parse_bundle(layout, sb_path, bundle_offset, bundle_name)
+        except (FrostbiteIndexError, OSError):
+            continue
+        for index, item in enumerate(bundle.files):
+            if item.kind != "res" or item.resource_type == MESHSET_RESOURCE_TYPE:
+                continue
+            record_key = (item.location.sha1, item.name.casefold())
+            if record_key in seen_records:
+                continue
+            seen_records.add(record_key)
+            if item.location.sha1.hex().casefold() == source_sha1:
+                continue
+            if scanned >= max_records:
+                exhaustive = False
+                return None, None, scanned, exhaustive
+            scanned += 1
+            try:
+                decoded = decode_cas_record(
+                    _read_cas(item.location), oodle, max_output_bytes=MAX_CAS_RECORD,
+                )
+            except (FrostbiteCasError, MeshFormatError, OSError, ValueError):
+                continue
+            if key not in decoded or not is_antstate_resource(decoded):
+                continue
+            try:
+                if not has_gd_data_asset_key(decoded, key):
+                    continue
+            except MeshFormatError:
+                continue
+            try:
+                relative_container = str(bundle.sb_path.relative_to(root))
+            except ValueError:
+                relative_container = str(bundle.sb_path)
+            internal = f"{item.name}.res"
+            resolved = AssetRecord(
+                path=bundle.sb_path,
+                relative_path=f"{relative_container}::{internal}",
+                kind="animation", extension=".res", size=item.location.original_size,
+                engine="Frostbite", directly_viewable=False,
+                container_path=bundle.sb_path, internal_path=internal,
+                metadata={
+                    "reader": "frostbite-animation-record",
+                    "record_kind": "res",
+                    "classification": "resolved-virtual-animation-bank",
+                    "virtual_asset_key": key.hex(),
+                    "referenced_by": asset.internal_path,
+                    "bundle_name": bundle.name,
+                    "bundle_offset": bundle.offset,
+                    "resource_index": index,
+                    "cas_id": item.location.cas_id,
+                    "cas_path": str(item.location.cas_path),
+                    "cas_offset": item.location.offset,
+                    "packed_size": item.location.packed_size,
+                    "original_size": item.location.original_size,
+                    "sha1": item.location.sha1.hex(),
+                },
+            )
+            return resolved, decoded, scanned, exhaustive
+    return None, None, scanned, exhaustive
+
+
 def extract_frostbite_ebx_dependencies(
     root: Path, asset: AssetRecord,
 ) -> tuple[bytes, list[tuple[AssetRecord, bytes]]]:

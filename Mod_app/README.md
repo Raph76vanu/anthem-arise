@@ -1,11 +1,118 @@
-# Game Asset Explorer 0.22.1
+# Game Asset Explorer 0.27.7
 
 A read-only, cross-game asset discovery tool for legitimately obtained game files.
 It scans a game directory, identifies common engine/container layouts, groups likely
 character meshes with nearby rigs, animations, materials and textures, ranks the
 groups, and renders supported geometry in an interactive viewport inside the program.
 
-## What version 0.22.1 can do
+## What version 0.27.7 can do
+
+**EXM rotation decoding:** dynamic six-byte keys now read the two low selector
+bits, restore the omitted quaternion component, and decode the remaining
+three values in their 15/15/16-bit ranges. Tests on the supplied four Outlaw
+Ranger clips, six Lancer preview clips and 86 shared EXM clips find no keys
+outside unit-quaternion bounds. All ten clips with resolved EXM bone mappings
+have no adjacent mapped-bone rotation jumps above 60 degrees. This replaces
+the old direct XYZ rule, whose raw components exceeded unit length in
+25.6–32.6% of the four Outlaw Ranger clips. The diagnostic PNGs compare the
+updated playback with that old rule. Please inspect an actual mesh and clip:
+mathematical and timing checks cannot establish game-accurate posing by
+themselves.
+
+**EXM animation diagnostics:** double-click `diagnose_exm_animation.bat`,
+choose an extracted animation `.res`, matching `exm_skeleton.ebx`, and the
+resolved Rigamate bank `.res`. The `animation_diagnostics` folder gets a
+comparison PNG per clip, `measurements.csv`, and a short explanation.
+Alternatively, run `python diagnose_exm_animation.py ANIMATION.res
+exm_skeleton.ebx BANK.res OUTPUT_FOLDER` from a terminal. This is a separate
+experiment: it does not modify the game's files or change animation playback.
+Rows compare the current rule to the previous XYZ rule, composition,
+bank-default, and half-strength hypotheses. All pictures for a given clip use one camera
+and scale. A low displacement score is not evidence of the correct codec.
+The supplied four Outlaw Ranger clips share the same complete frame range,
+so changing between per-channel and shared-clip time would make no difference.
+
+The animation **Clip** selector now includes an explicit clip counter and
+**Previous / Next** buttons. For a record containing four Eclipse clips, the
+counter runs from `1 / 4` to `4 / 4`, and changing clips also changes the
+bank-mapped bone rotations selected for playback. Choosing another clip during
+playback stops the old one so **Play** starts the newly selected clip.
+
+To check EXM bone motion independently of skinning, select and preview the
+Lancer mesh, enable **Use for animation**, then select the Patch Outlaw Ranger
+animation RES in **Animations**. Choose an `EXM_SCAV_EXP_2h_Flyer_Idle_Twitch`
+clip and click **Play**. Uncheck **Mesh** in the viewport to show only its moving
+bone overlay; recheck it to compare the animated geometry. Bone-only playback
+skips CPU mesh skinning and rendering, which helps on slower laptops. The four
+provided clips resolve 41–64 named rotations against the 182-joint EXM skeleton.
+They belong to an enemy animation set: sharing the EXM rig allows this mapping
+experiment, but does not establish that they are player Lancer animations.
+Quaternion layout has strong cross-file evidence; pose composition, omitted
+constant rotations and root motion still need visual verification.
+
+Some Anthem Eclipse animations contain no float channels. The decoder now
+accepts the verified zero-float descriptor and reads the remaining position
+and rotation curves. The supplied EXM player shared bundle decodes all 86
+animation objects, whereas seven previously caused an invalid channel count
+error. This RES contains no clip controller names, ChannelToDof mapping, or
+Rigamate pointer, and its supplied EBX contains only a resource reference.
+Those unnamed curves can be inspected, but their bone assignments cannot yet
+be verified for playback. The preview explains this limitation directly.
+
+Use **Exclude** beside **Search** to hide results containing any of the
+entered words. Search requires every word; Exclude rejects a result if any
+word appears in its archive path, internal path, bundle name, or indexed clip
+name. Both filters work across asset categories and inside folder-only views.
+For example, search `EXM` and exclude `enemies` to hide records whose path
+contains the `enemies_bgc` folder. The animation clip selector now occupies
+its own full-width row so complete clip names are easier to inspect.
+
+Animations now include an opt-in **Search clip names** filter. When enabled,
+the explorer indexes names embedded inside Frostbite `.res` animation records
+in the background and searches those names alongside paths. Queries such as
+`idle`, `walk`, `run`, or `flight` can therefore find a matching sub-animation
+inside a generic archive; selecting the result still opens the full record and
+its clip selector.
+
+Lancer player-preview clips in the generic `exo/playerpreview` directory now
+identify their EXM rig from their verified `exm_lancer_` filename. The generic
+`exo` directory is no longer mistaken for a Javelin family; a mismatched
+filename remains incompatible. With the supplied EXM Rigamate bank and
+182-bone skeleton, `EXM_SuitClose` maps 38 animated bone rotations and can
+reach the experimental Play control. Suit interaction clips are not necessarily
+useful for running or flying, or fully visible on the base Javelin mesh.
+
+Anthem Eclipse animation channel tables now use their stored array offsets.
+Some Lancer player-preview clips add alignment padding between float and
+vector channels; previously this caused "An Eclipse key-time range points
+outside its stream". The supplied Lancer RES now decodes all six clips:
+`EXM_SuitClose`, `EXM_Suit_EnterEXM_exm_Lancer`, `EXM_SuitOpen_Idle`,
+`EXM_Suit_ExitEXM_01_Lancer`, `EXM_SuitOpen`, and `EXM_SuitClose_Idle`.
+These clips represent suit interactions and suit-state idles, and are not
+verified as full-body standing idle animations. Visual posing still depends
+on a compatible resolved Rigamate bank and the experimental rotation decoder.
+
+In **Animations**, check **.res only** to hide `.ebx` metadata records. This
+filters the existing inventory before folder grouping, including within
+folder-only and virtual-folder views. Equipment subfolders such as `beam` no
+longer override the EXM Lancer family when evaluating animation candidates.
+Matching a family alone does not prove that a clip is suitable for the full
+body or that the packed rotation data has been decoded correctly.
+
+Earlier versions tried swapping XYZ values to smooth apparent animation
+jumps. The 48-bit decoder now reads the stored omitted-component selector,
+so the preview no longer applies that swap heuristic. The remaining pose may
+still be wrong if bank defaults, constant channels or root motion are missing.
+
+When the matching EXM Rigamate resource is available, the animation preview
+matches channel DOF IDs to named DOF sets and then to the selected EXM skeleton.
+It can play decoded rotation curves and skin the mesh using its four stored bone
+weights per vertex. The sample Sentinel idle clip resolves 56 moving rotations
+to its supplied 182-bone skeleton; helper joints outside that skeleton are
+skipped. Rotations are currently interpreted relative to the bank's default
+pose. This composition is experimental; visual accuracy, constant channels,
+root translation and non-rotation curves still need work. On slower machines,
+CPU skinning and software rendering may reduce frame rate.
 
 - Scan loose files without modifying the game installation.
 - Recognize common mesh, skeleton, animation, material and texture extensions.
@@ -122,6 +229,27 @@ groups, and renders supported geometry in an interactive viewport inside the pro
   imports/arrays without falsely claiming that a configuration record is a
   playable clip. Playback controls remain disabled until compressed keyframes
   are decoded.
+- Decode every embedded Anthem `EclipseAnimationAsset` clip from a selected
+  AntState RES, including 8/16-bit key times, quantized float/vector curves,
+  dynamic unit-quaternion curves, exact clip names, and `ChannelToDofAsset`
+  identifier lists. The clip selector shows real clips instead of heuristic
+  byte-pattern groups. Selecting another clip recomputes its own mapping.
+- Refuse unsafe animation playback while the referenced Rigamate bank is absent.
+  Anthem's DOF IDs are bank-local identifiers, not SkeletonAsset bone indices;
+  sequential assignment caused the scrambled poses. Dynamic quaternion words
+  are no longer misread as Euler angles.
+- Decode real `BankPointerAsset` records from AntState payloads, distinguish a
+  locally resolved ActionStation pointer from an external Rigamate pointer, and
+  display the exact eight-byte `SubjectBankAsset` key. When an external
+  Rigamate pointer is selected, search decoded RES records across the Anthem
+  installation (owning and Javelin-family bundles first), report the resolved
+  virtual resource or a bounded not-found result, and enable experimental
+  playback only when the bank IDs and named skeleton joints match.
+- Keep the successfully resolved Rigamate payload available in memory and
+  enable **Extract Rigamate bank…** beside the animation diagnostics. The
+  button writes the exact decoded `.res` plus its archive-location JSON without
+  modifying Anthem, providing the concrete bank sample needed to reverse its
+  DOF-to-bone table rather than guessing from filenames or skeleton order.
 - Resolve a selected Frostbite MeshSet and its declared geometry chunk by typed
   record id, verify both compressed SHA-1 values, decode their bounded CAS block
   streams with the game's installed Oodle runtime, and render the lowest-detail

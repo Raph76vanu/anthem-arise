@@ -1,4 +1,10 @@
-"""Turn decoded animation channels (frostbite_animation_channels.py) into an
+"""Legacy experimental pose evaluator retained for regression comparison.
+
+The GUI no longer enables this guessed-mapping path. Anthem's ChannelToDof IDs
+require the referenced Rigamate bank, and the dynamic rotations are compressed
+quaternions rather than the Euler values accepted here.
+
+Turn decoded animation channels (frostbite_animation_channels.py) into an
 actual animated skeleton pose, using a best-guess channel-to-bone mapping.
 
 This module is deliberately upfront about what is proven versus guessed:
@@ -207,6 +213,16 @@ def _unwrap_component(raw: int, reference: int, period: int = 65536) -> int:
 
 
 def sample_quaternion_channel(channel: QuaternionChannel, phase: float) -> Quaternion:
+    # Frostbite's EclipseAnimationAsset reader has already reconstructed its
+    # quantized quaternion components. The older low-level AntState inspector
+    # exposes raw Euler-like words instead; both paths share pose evaluation.
+    decoded_values = getattr(channel, "values", None)
+    if decoded_values is not None:
+        if not channel.times or len(decoded_values) != len(channel.times):
+            return IDENTITY_QUATERNION
+        t = _channel_local_time(channel.times, phase)
+        i0, i1, blend = _bracket(channel.times, t)
+        return quaternion_slerp(decoded_values[i0], decoded_values[i1], blend)
     t = _channel_local_time(channel.times, phase)
     i0, i1, blend = _bracket(channel.times, t)
     raw0 = channel.raw_xyz[i0]
@@ -286,13 +302,15 @@ def filter_healthy_channels(
 # Pose evaluation (forward kinematics from bind-pose positions).
 # ---------------------------------------------------------------------------
 
-def evaluate_pose(
+def evaluate_pose_transforms(
     skeleton: SkeletonData,
     bind_rotations: list[Quaternion],
     bone_mapping: list[int],
     quaternion_channels: list[QuaternionChannel],
     phase: float,
-) -> SkeletonData:
+    *,
+    rotation_mode: str = "bind_delta",
+) -> tuple[SkeletonData, tuple[Quaternion, ...]]:
     """Produce a new SkeletonData with world-space joint positions at a
     normalized point in the loop, phase in [0, 1].
 
@@ -315,6 +333,8 @@ def evaluate_pose(
     (assumed here) versus something else -- this is the next thing to
     confirm visually.
     """
+    if rotation_mode not in {"bind_delta", "delta_bind", "absolute"}:
+        raise ValueError(f"Unknown rotation mode: {rotation_mode}")
     joints = skeleton.joints
 
     # Precompute each joint's ACCUMULATED bind-pose world rotation (root to
@@ -368,7 +388,13 @@ def evaluate_pose(
         bind_rotation = bind_rotations[index] if index < len(bind_rotations) else IDENTITY_QUATERNION
         channel = channel_for_joint.get(index)
         if channel is not None:
-            local_rotation = quaternion_multiply(bind_rotation, sample_quaternion_channel(channel, phase))
+            animated_rotation = sample_quaternion_channel(channel, phase)
+            if rotation_mode == "absolute":
+                local_rotation = animated_rotation
+            elif rotation_mode == "delta_bind":
+                local_rotation = quaternion_multiply(animated_rotation, bind_rotation)
+            else:
+                local_rotation = quaternion_multiply(bind_rotation, animated_rotation)
         else:
             local_rotation = bind_rotation
 
@@ -393,7 +419,18 @@ def evaluate_pose(
         (joint[0], joint[1], *world_position[index])
         for index, joint in enumerate(joints)
     ]
-    return SkeletonData(skeleton.name, new_joints)
+    return SkeletonData(skeleton.name, new_joints), tuple(world_rotation)
+
+
+def evaluate_pose(
+    skeleton: SkeletonData,
+    bind_rotations: list[Quaternion],
+    bone_mapping: list[int],
+    quaternion_channels: list[QuaternionChannel],
+    phase: float,
+) -> SkeletonData:
+    """Return the posed bone positions; see evaluate_pose_transforms for skinning."""
+    return evaluate_pose_transforms(skeleton, bind_rotations, bone_mapping, quaternion_channels, phase)[0]
 
 
 def quaternion_angle_degrees(q: Quaternion) -> float:
@@ -476,7 +513,8 @@ def describe_pose_debug(
         bind_rotation = bind_rotations[index] if index < len(bind_rotations) else IDENTITY_QUATERNION
         entry = channel_for_joint.get(index)
         channel_index = entry[0] if entry else None
-        channel_key_count = entry[1].key_count if entry else None
+        channel_key_count = (getattr(entry[1], "key_count", len(entry[1].times))
+                             if entry else None)
         channel_angle_deg = None
         sway_deg = None
         if entry is not None:

@@ -184,6 +184,15 @@ def category_for_asset(asset: AssetRecord) -> str:
         return "Skeletons"
     if asset.kind == "texture":
         return "Images" if asset.extension in IMAGE_EXTENSIONS else "Textures"
+    if asset.kind == "other":
+        # A reference string that didn't match any known naming pattern --
+        # e.g. an Anthem texture .res file, since (like meshes, animations
+        # and skeletons before it) Anthem doesn't name texture files
+        # helpfully. Previously these were silently dropped entirely rather
+        # than showing up anywhere; routing them here instead of the mesh
+        # fallback keeps them out of "Characters / meshes" while still
+        # making them findable via this category or "All".
+        return "Other / unclassified"
     if asset.kind == "container":
         # A generic engine container is an archive, not the semantic asset its
         # filename happens to mention. Its typed children are classified after

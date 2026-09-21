@@ -21,6 +21,7 @@ from game_asset_explorer.frostbite_index import (
     is_animation_record,
     load_chunk_index,
     parse_bundle,
+    resolve_frostbite_virtual_asset_key,
     save_chunk_index,
 )
 from game_asset_explorer.models import AssetRecord
@@ -31,6 +32,64 @@ def _cas_record(payload: bytes) -> bytes:
 
 
 class FrostbiteIndexTests(unittest.TestCase):
+    def test_virtual_asset_resolver_finds_key_in_unclassified_res(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            sb = root / "default.sb"
+            sb.write_bytes(b"bundle")
+            cas = root / "cas_01.cas"
+            cas.write_bytes(b"cas")
+            key = bytes.fromhex("cdb55c0a6ebc15cd")
+
+            source_location = CasLocation(1, cas, 1, 8, 8, b"s" * 20)
+            target_location = CasLocation(1, cas, 2, 8, 8, b"t" * 20)
+            source_item = BundleFile("res", "animation/exm/source", 1, b"", source_location)
+            target_item = BundleFile("res", "hidden/subject_bank", 2, b"", target_location)
+            bundle = BundleInfo("animation/exm/test", sb, 12, (source_item, target_item))
+            source = AssetRecord(
+                path=sb, relative_path="default.sb::animation/exm/source.res",
+                kind="animation", extension=".res", size=8, engine="Frostbite",
+                internal_path="animation/exm/source.res",
+                metadata={
+                    "reader": "frostbite-animation-record", "record_kind": "res",
+                    "bundle_name": bundle.name, "bundle_offset": 12,
+                    "sha1": source_location.sha1.hex(), "cas_id": 1,
+                    "cas_path": str(cas), "cas_offset": 1, "packed_size": 8,
+                    "original_size": 8,
+                },
+            )
+            target_raw = bytearray(128)
+            target_raw[:8] = b"GD.DATAl"
+            struct.pack_into("<I", target_raw, 8, len(target_raw))
+            target_raw[72:80] = key
+            target_raw[96:103] = b"GD.REFL"
+
+            layout = LayoutMap(root, root, None, {}, {1: cas})
+            with patch(
+                "game_asset_explorer.frostbite_index.load_layout_map", return_value=layout,
+            ), patch(
+                "game_asset_explorer.frostbite_index.find_oodle_runtime", return_value=Path("oo2core.dll"),
+            ), patch(
+                "game_asset_explorer.frostbite_index.OodleDecoder", return_value=object(),
+            ), patch(
+                "game_asset_explorer.frostbite_index._toc_paths", return_value=[],
+            ), patch(
+                "game_asset_explorer.frostbite_index.parse_bundle", return_value=bundle,
+            ), patch(
+                "game_asset_explorer.frostbite_index._read_cas", return_value=b"packed",
+            ), patch(
+                "game_asset_explorer.frostbite_index.decode_cas_record", return_value=bytes(target_raw),
+            ):
+                resolved, decoded, scanned, exhaustive = resolve_frostbite_virtual_asset_key(
+                    root, source, key,
+                )
+
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved.internal_path, "hidden/subject_bank.res")
+        self.assertEqual(decoded, bytes(target_raw))
+        self.assertEqual(scanned, 1)
+        self.assertTrue(exhaustive)
+
     def test_animation_record_does_not_mislabel_meshset_in_animation_folder(self) -> None:
         location = CasLocation(1, Path("cas_01.cas"), 0, 8, 8, b"x" * 20)
         mesh = BundleFile(
