@@ -9,7 +9,6 @@ from pathlib import Path
 from .frostbite_index import (
     extract_frostbite_ebx_dependencies, extract_frostbite_record,
     inspect_frostbite_meshsets, preview_frostbite_meshset,
-    resolve_frostbite_virtual_asset_key,
 )
 from .geometry import MeshFormatError
 from .models import AssetRecord
@@ -91,21 +90,6 @@ def main() -> int:
                     }
                     for linked, linked_raw in dependencies
                 ],
-            }
-        elif action == "resolve_virtual_asset_key":
-            asset = _asset(dict(request["asset"]))
-            key = bytes.fromhex(str(request["key"]))
-            resolved, raw, scanned, exhaustive = resolve_frostbite_virtual_asset_key(
-                root, asset, key,
-            )
-            response = {
-                "kind": "virtual_asset_resolution",
-                "key": key.hex(),
-                "scanned_records": scanned,
-                "exhaustive": exhaustive,
-                "asset": resolved.to_dict() if resolved is not None else None,
-                "data": base64.b64encode(raw).decode("ascii") if raw is not None else None,
-                "size": len(raw) if raw is not None else 0,
             }
         else:
             raise ValueError("Unknown Frostbite worker action.")

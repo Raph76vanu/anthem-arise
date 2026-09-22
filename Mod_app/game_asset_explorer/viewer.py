@@ -91,12 +91,6 @@ class MeshViewer(ttk.Frame):
             command=self.request_draw, state="disabled",
         )
         self.bones_button.grid(row=0, column=4, padx=(0, 6))
-        self.mesh_visible = tk.BooleanVar(value=True)
-        self.mesh_button = ttk.Checkbutton(
-            toolbar, text="Mesh", variable=self.mesh_visible,
-            command=self._toggle_mesh_visibility, state="disabled",
-        )
-        self.mesh_button.grid(row=0, column=5, padx=(0, 6))
         ttk.Button(toolbar, text="Reset view", command=self.reset).grid(row=0, column=2)
         self.detail_frame = ttk.Frame(toolbar)
         self.detail_label_var = tk.StringVar(value="Detail")
@@ -162,7 +156,6 @@ class MeshViewer(ttk.Frame):
         self.mesh_skeleton = None
         self.bones_visible.set(False)
         self.bones_button.configure(state="disabled")
-        self.mesh_button.configure(state="normal")
         self._image_tk = None
         self.title_var.set(f"{title} · {sum(len(m.vertices) for m in meshes):,} vertices · drag to rotate, wheel to zoom")
         self.reset()
@@ -178,7 +171,6 @@ class MeshViewer(ttk.Frame):
         self.mesh_skeleton = None
         self.bones_visible.set(False)
         self.bones_button.configure(state="disabled")
-        self.mesh_button.configure(state="disabled")
         self.image = image.convert("RGBA")
         self.title_var.set(f"{title} · {image.width}×{image.height} · 2D image")
         self.request_draw()
@@ -190,7 +182,6 @@ class MeshViewer(ttk.Frame):
         self.mesh_skeleton = None
         self.bones_visible.set(False)
         self.bones_button.configure(state="disabled")
-        self.mesh_button.configure(state="disabled")
         self.image = None
         self._image_tk = None
         self.title_var.set(message)
@@ -258,11 +249,6 @@ class MeshViewer(ttk.Frame):
         self.yaw, self.pitch, self.zoom = -0.6, -0.25, 1.0
         self.request_draw()
 
-    def _toggle_mesh_visibility(self) -> None:
-        if not self.mesh_visible.get() and self.mesh_skeleton is not None:
-            self.bones_visible.set(True)
-        self.request_draw()
-
     def _press(self, event) -> None:
         self.last = (event.x, event.y)
 
@@ -314,12 +300,6 @@ class MeshViewer(ttk.Frame):
         if not self.meshes:
             self.canvas.delete("all")
             self.canvas.create_text(width / 2, height / 2, text=self.title_var.get(), fill="#9aa4b2", width=width - 40)
-            return
-        if not self.mesh_visible.get():
-            self._raster_generation += 1  # Discard any mesh frame still rendering.
-            self._raster_requested = False
-            self.canvas.delete("all")
-            self._draw_mesh_skeleton_overlay(width, height)
             return
         if not interactive:
             self._request_full_raster(width, height)
@@ -460,7 +440,6 @@ class MeshViewer(ttk.Frame):
         self.mesh_skeleton = None
         self.bones_visible.set(False)
         self.bones_button.configure(state="disabled")
-        self.mesh_button.configure(state="disabled")
         self.image = None
         self.skeleton = SkeletonData(skeleton.name, normalized)
         self.title_var.set(f"{title} · {len(skeleton.joints):,} joints · drag to rotate, wheel to zoom")
@@ -483,24 +462,6 @@ class MeshViewer(ttk.Frame):
         self.mesh_skeleton = SkeletonData(skeleton.name, joints)
         self.bones_visible.set(True)
         self.bones_button.configure(state="normal")
-        self.request_draw()
-
-    def set_mesh_pose(self, meshes: list[MeshData] | None, skeleton: SkeletonData) -> None:
-        """Update the posed bones and optionally skinned geometry without moving the camera."""
-        if not self.meshes or (meshes is not None and len(meshes) != len(self.meshes)):
-            return
-        center, extent = self._mesh_center, self._mesh_extent
-        if meshes is not None:
-            self.meshes = [MeshData(
-                mesh.name,
-                [tuple((vertex[i] - center[i]) / extent for i in range(3)) for vertex in mesh.vertices],
-                mesh.faces, mesh.skin_bones, mesh.skin_weights,
-            ) for mesh in meshes]
-        self.mesh_skeleton = SkeletonData(skeleton.name, [
-            (name, parent, (x - center[0]) / extent, (y - center[1]) / extent,
-             (z - center[2]) / extent)
-            for name, parent, x, y, z in skeleton.joints
-        ])
         self.request_draw()
 
     def _draw_mesh_skeleton_overlay(self, width: int, height: int) -> None:

@@ -5,7 +5,7 @@ import unittest
 
 from game_asset_explorer.frostbite_animation_channels import QuaternionChannel
 from game_asset_explorer.frostbite_animation_playback import (
-    axis_angle_to_quaternion, evaluate_pose, evaluate_pose_transforms, guess_bone_mapping,
+    axis_angle_to_quaternion, evaluate_pose, guess_bone_mapping,
     quaternion_angle_degrees, quaternion_multiply, quaternion_rotate_vector,
 )
 from game_asset_explorer.geometry import SkeletonData
@@ -96,26 +96,6 @@ class BindPoseReconstructionTests(unittest.TestCase):
         identity = (0.0, 0.0, 0.0, 1.0)
         pose = evaluate_pose(skeleton, [identity, identity], [], [], 0.0)
         self.assertEqual(pose.joints[1][2:5], (0.0, 1.0, 0.0))
-
-    def test_diagnostic_rotation_rules_differ_without_changing_default_playback(self) -> None:
-        from game_asset_explorer.frostbite_animation import QuaternionChannel as EclipseChannel
-
-        bind = axis_angle_to_quaternion((0.0, 0.0, 1.0), math.pi / 2)
-        animated = axis_angle_to_quaternion((1.0, 0.0, 0.0), math.pi / 2)
-        skeleton = SkeletonData("toy", [
-            ("Root", -1, 0.0, 0.0, 0.0),
-            ("Elbow", 0, 1.0, 0.0, 0.0),
-            ("Hand", 1, 1.0, 1.0, 0.0),
-        ])
-        rotations = [(0.0, 0.0, 0.0, 1.0), bind, (0.0, 0.0, 0.0, 1.0)]
-        channels = [EclipseChannel((0, 1), (animated, animated))]
-        default = evaluate_pose_transforms(skeleton, rotations, [1], channels, 0.5)[0]
-        before = evaluate_pose_transforms(
-            skeleton, rotations, [1], channels, 0.5, rotation_mode="delta_bind",
-        )[0]
-        self.assertNotEqual(default.joints[2][2:], before.joints[2][2:])
-        self.assertEqual(default.joints[2][2:],
-                         evaluate_pose_transforms(skeleton, rotations, [1], channels, 0.5)[0].joints[2][2:])
 
 
 class BoneMappingTests(unittest.TestCase):
