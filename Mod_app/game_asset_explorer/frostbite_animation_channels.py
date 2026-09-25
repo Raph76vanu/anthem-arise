@@ -1,4 +1,10 @@
-"""Decode EclipseAnimationFloatChannel / EclipseAnimationVectorChannel /
+"""Legacy experimental channel reader retained for regression comparison.
+
+The GUI no longer calls this module. Its heuristic group search and signed
+Euler interpretation were disproved by the bounded Eclipse decoder in
+``frostbite_animation.py``. Do not use this module for Anthem playback.
+
+Decode EclipseAnimationFloatChannel / EclipseAnimationVectorChannel /
 EclipseAnimationQuaternionChannel keyframe data out of an already-decoded
 Anthem AntState resource (see frostbite_state.py for the container format
 this sits inside).
@@ -446,45 +452,6 @@ def decode_quaternion_array(raw: bytes, header_addr: int, count: int, declared_o
         channels.append(channel)
         addr += 12
     return channels, errors
-
-
-def decode_quaternion_array_positional(raw: bytes, header_addr: int, count: int, declared_offset: int,
-                                        block_offset: int) -> list[QuaternionChannel | None]:
-    """Like decode_quaternion_array, but returns one entry PER DECLARED
-    CHANNEL POSITION (None where a channel fails to decode), instead of a
-    shorter, renumbered list with smoothness-failing entries silently
-    dropped.
-
-    Needed to combine with an externally-resolved bone mapping (e.g. a real
-    Rigamate bank's DOF-to-channel-position table): that mapping refers to
-    channels by their raw position in the declared array, which an
-    independent decoder (not ours) may include even when our own
-    smoothness heuristic would reject them. Renumbering after dropping
-    entries -- as decode_quaternion_array does for direct playback use --
-    would silently misalign every position after the first drop. Still
-    stops early on genuine structural garbage (the array-overrun case),
-    since positions past that point aren't real channels at all.
-    """
-    start = find_quaternion_array_start(raw, header_addr, count, declared_offset, block_offset)
-    if start is None:
-        return [None] * count
-    channels: list[QuaternionChannel | None] = []
-    consecutive_structural_errors = 0
-    addr = start
-    for _ in range(count):
-        try:
-            channel = decode_quaternion_channel(raw, addr, block_offset)
-        except ChannelDecodeError:
-            channels.append(None)
-            consecutive_structural_errors += 1
-            if consecutive_structural_errors >= 2:
-                break
-            addr += 12
-            continue
-        consecutive_structural_errors = 0
-        channels.append(channel)
-        addr += 12
-    return channels
 
 
 

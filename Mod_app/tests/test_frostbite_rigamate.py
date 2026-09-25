@@ -6,6 +6,7 @@ from game_asset_explorer.frostbite_animation import (
 )
 from game_asset_explorer.frostbite_rigamate import (
     inspect_rigamate_dof_types, decode_rigamate_bone_mapping,
+    extract_rigamate_mapping_bank,
     stabilize_component_swaps,
 )
 from game_asset_explorer.geometry import SkeletonData
@@ -59,7 +60,9 @@ class RigamateTypeTests(unittest.TestCase):
 
     def test_named_dof_sets_join_clip_ids_to_bones_and_reject_wrong_groups(self):
         rig = block(0xB1240F5A, 608)
-        rig[208:221] = b"EXM_skeleton\0"
+        rig_key = b"EXM-RIG!"
+        rig[216:224] = rig_key
+        rig[240:253] = b"EXM_skeleton\0"
         struct.pack_into("<IIQ", rig, 48, 2, 2, 0x1F0)  # ids at 0x200
         struct.pack_into("<IIQ", rig, 64, 1, 1, 0x220)  # indices at 0x230
         struct.pack_into("<IIQ", rig, 128, 1, 1, 0x210)  # set key at 0x220
@@ -85,10 +88,67 @@ class RigamateTypeTests(unittest.TestCase):
         ), (11, 12))
         result = decode_rigamate_bone_mapping(bytes(rig + group), clip, skeleton)
         self.assertIsNotNone(result)
+        self.assertIsNotNone(decode_rigamate_bone_mapping(
+            bytes(rig + group), clip, skeleton, expected_rig_key=rig_key,
+        ))
+        self.assertIsNone(decode_rigamate_bone_mapping(
+            bytes(rig + group), clip, skeleton, expected_rig_key=b"WRONGRIG",
+        ))
         self.assertEqual(result.bone_indices, (1, 0))
-        self.assertEqual(len(result.pose_channels(clip)), 2)
+        compact = extract_rigamate_mapping_bank(bytes(rig + group), rig_key)
+        self.assertIsNotNone(compact)
+        compact_result = decode_rigamate_bone_mapping(
+            compact, clip, skeleton, expected_rig_key=rig_key,
+        )
+        self.assertIsNotNone(compact_result)
+        self.assertEqual(compact_result.bone_indices, (1, 0))
+        pose_channels = result.pose_channels(clip)
+        self.assertEqual(len(pose_channels), 2)
+        self.assertIs(pose_channels[0], clip.quaternion_channels[0])
+        unresolved = EclipseAnimationClip(clip.name, clip.asset_id, 0, (), (), (
+            QuaternionChannel((), (), b"12345678"), clip.quaternion_channels[1],
+        ), clip.dof_ids)
+        partial = decode_rigamate_bone_mapping(bytes(rig + group), unresolved, skeleton)
+        complete = decode_rigamate_bone_mapping(
+            bytes(rig + group), unresolved, skeleton, include_constants=True,
+        )
+        self.assertEqual(partial.bone_indices, (0,))
+        self.assertEqual(len(partial.default_rotations), len(partial.bone_indices))
+        self.assertEqual(complete.bone_indices, (1, 0))
+        self.assertEqual(len(complete.default_rotations), len(complete.bone_indices))
         struct.pack_into("<Q", group, 88, 100)
         self.assertIsNone(decode_rigamate_bone_mapping(bytes(rig + group), clip, skeleton))
+
+    def test_interceptor_rig_name_is_family_neutral(self):
+        rig = block(0xB1240F5A, 608)
+        rig_key = b"EXF-RIG!"
+        rig[216:224] = rig_key
+        rig[240:253] = b"EXF_skeleton\0"
+        struct.pack_into("<IIQ", rig, 48, 1, 1, 0x1F0)
+        struct.pack_into("<IIQ", rig, 64, 1, 1, 0x220)
+        struct.pack_into("<IIQ", rig, 128, 1, 1, 0x210)
+        struct.pack_into("<IIQ", rig, 144, 1, 1, 0x120)
+        struct.pack_into("<I", rig, 0x120, 11)
+        struct.pack_into("<4f", rig, 0x130, 0, 0, 0, 1)
+        struct.pack_into("<I", rig, 0x200, 11)
+        struct.pack_into("<Q", rig, 0x220, 99)
+        struct.pack_into("<I", rig, 0x230, 0)
+        group = block(0xBB267D6A, 176)
+        struct.pack_into("<II", group, 64, 1, 1)
+        struct.pack_into("<Q", group, 88, 99)
+        group[101:105] = b"EXF\0"
+        struct.pack_into("<IIQ", group, 112, 8, 8, 128)
+        group[144:152] = b"Spine.q\0"
+        clip = EclipseAnimationClip(
+            "exf", "id", 1, (), (),
+            (QuaternionChannel((0,), ((0, 0, 0, 1),)),), (11,),
+        )
+        skeleton = SkeletonData("exf", [("Spine", -1, 0, 0, 0)])
+        result = decode_rigamate_bone_mapping(
+            bytes(rig + group), clip, skeleton, expected_rig_key=rig_key,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result.bone_indices, (0,))
 
 
 if __name__ == "__main__":

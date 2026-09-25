@@ -187,13 +187,18 @@ def _record_from_dict(data: dict[str, object]) -> AssetRecord:
 
 def _worker(
     action: str, root: Path, asset: AssetRecord | None, timeout: int,
-    lod_index: int | None = None,
+    lod_index: int | None = None, virtual_key: bytes | None = None,
+    assets: list[AssetRecord] | None = None,
 ) -> dict[str, object]:
     request: dict[str, object] = {"action": action, "root": str(root)}
     if asset is not None:
         request["asset"] = asset.to_dict()
     if lod_index is not None:
         request["lod"] = lod_index
+    if virtual_key is not None:
+        request["key"] = virtual_key.hex()
+    if assets is not None:
+        request["assets"] = [item.to_dict() for item in assets]
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         completed = subprocess.run(
@@ -280,6 +285,21 @@ def extract_frostbite_record_isolated(
     return raw
 
 
+def count_frostbite_animation_clips_isolated(
+    root: Path, assets: list[AssetRecord], *, timeout: int = 1800,
+) -> list[int | None]:
+    """Count clips across many RES records in one crash-contained worker."""
+    response = _worker(
+        "count_animation_clips", root, None, timeout, assets=assets,
+    )
+    if response.get("kind") != "animation_clip_counts":
+        raise MeshFormatError("Frostbite reader returned invalid animation clip counts.")
+    raw_counts = response.get("counts")
+    if not isinstance(raw_counts, list) or len(raw_counts) != len(assets):
+        raise MeshFormatError("Frostbite reader returned an incomplete animation count table.")
+    return [None if value is None else max(0, int(value)) for value in raw_counts]
+
+
 def extract_frostbite_record_dependencies_isolated(
     root: Path, asset: AssetRecord, *, timeout: int = 600,
 ) -> tuple[bytes, list[tuple[AssetRecord, bytes]]]:
@@ -307,3 +327,61 @@ def extract_frostbite_record_dependencies_isolated(
             decoded(item.get("data"), item.get("size", -1)),
         ))
     return primary, dependencies
+
+
+def resolve_frostbite_virtual_asset_key_isolated(
+    root: Path, asset: AssetRecord, key: bytes, *, timeout: int = 900,
+) -> tuple[AssetRecord | None, bytes | None, int, bool]:
+    """Resolve one Anthem GD.DATA key in a crash-contained worker."""
+    if len(key) != 8:
+        raise MeshFormatError("A Gameplay Data virtual-asset key must be exactly eight bytes.")
+    response = _worker(
+        "resolve_virtual_asset_key", root, asset, timeout, virtual_key=key,
+    )
+    if response.get("kind") != "virtual_asset_resolution":
+        raise MeshFormatError("Frostbite reader returned invalid virtual-asset data.")
+    scanned = int(response.get("scanned_records", 0))
+    exhaustive = bool(response.get("exhaustive"))
+    asset_data = response.get("asset")
+    encoded = response.get("data")
+    if asset_data is None and encoded is None:
+        return None, None, scanned, exhaustive
+    if not isinstance(asset_data, dict) or not isinstance(encoded, str):
+        raise MeshFormatError("Frostbite reader returned incomplete virtual-asset data.")
+    resolved = _record_from_dict(asset_data)
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError) as error:
+        raise MeshFormatError("Frostbite reader returned corrupt virtual-asset bytes.") from error
+    if len(raw) != int(response.get("size", -1)):
+        raise MeshFormatError("Frostbite reader returned a truncated virtual asset.")
+    return resolved, raw, scanned, exhaustive
+
+
+def resolve_frostbite_primary_rig_key_isolated(
+    root: Path, asset: AssetRecord, key: bytes, *, timeout: int = 900,
+) -> tuple[AssetRecord | None, bytes | None, int, bool]:
+    """Resolve and return the compact named mapping for one PrimaryRig key."""
+    if len(key) != 8:
+        raise MeshFormatError("A PrimaryRig virtual-asset key must be exactly eight bytes.")
+    response = _worker(
+        "resolve_primary_rig_key", root, asset, timeout, virtual_key=key,
+    )
+    if response.get("kind") != "primary_rig_resolution":
+        raise MeshFormatError("Frostbite reader returned invalid PrimaryRig data.")
+    scanned = int(response.get("scanned_records", 0))
+    exhaustive = bool(response.get("exhaustive"))
+    asset_data = response.get("asset")
+    encoded = response.get("data")
+    if asset_data is None and encoded is None:
+        return None, None, scanned, exhaustive
+    if not isinstance(asset_data, dict) or not isinstance(encoded, str):
+        raise MeshFormatError("Frostbite reader returned incomplete PrimaryRig data.")
+    resolved = _record_from_dict(asset_data)
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError) as error:
+        raise MeshFormatError("Frostbite reader returned corrupt PrimaryRig data.") from error
+    if len(raw) != int(response.get("size", -1)):
+        raise MeshFormatError("Frostbite reader returned a truncated PrimaryRig mapping.")
+    return resolved, raw, scanned, exhaustive

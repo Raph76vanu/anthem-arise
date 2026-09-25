@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import struct
 import tempfile
 import unittest
@@ -19,8 +20,10 @@ from game_asset_explorer.frostbite_index import (
     find_bundle_chunks,
     frostbite_rig_record_kind,
     is_animation_record,
+    iter_toc_chunks,
     load_chunk_index,
     parse_bundle,
+    resolve_frostbite_virtual_asset_key,
     save_chunk_index,
 )
 from game_asset_explorer.models import AssetRecord
@@ -31,6 +34,96 @@ def _cas_record(payload: bytes) -> bytes:
 
 
 class FrostbiteIndexTests(unittest.TestCase):
+    def test_anthem_toc_level_streamed_chunk_is_resolved(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cas = root / "cas_01.cas"
+            cas.write_bytes(b"x" * 256)
+            uid = uuid.UUID("00112233-4455-6677-8899-aabbccddeeff")
+            guid_offset = 64
+            location_offset = 96
+            payload = bytearray(128)
+            struct.pack_into(
+                ">12I", payload, 0,
+                0x30, 0, 0, 48, guid_offset, 1, location_offset, 0, 0, 0, 0, 0,
+            )
+            raw_guid = uid.bytes_le[::-1]
+            payload[guid_offset:guid_offset + 16] = raw_guid
+            struct.pack_into(">I", payload, guid_offset + 16, 0)
+            payload[location_offset:location_offset + 4] = bytes((0, 0, 5, 1))
+            struct.pack_into(">II", payload, location_offset + 4, 32, 64)
+            layout = LayoutMap(root, root, None, {(False, 5): root}, {0x501: cas})
+
+            with patch(
+                "game_asset_explorer.frostbite_index._toc_payload",
+                return_value=io.BytesIO(payload),
+            ):
+                chunks = list(iter_toc_chunks(layout, root / "default.toc"))
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].uid, uid.bytes)
+        self.assertEqual(chunks[0].location.cas_id, 0x501)
+        self.assertEqual(chunks[0].location.offset, 32)
+        self.assertEqual(chunks[0].location.packed_size, 64)
+
+    def test_virtual_asset_resolver_finds_key_in_unclassified_res(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            sb = root / "default.sb"
+            sb.write_bytes(b"bundle")
+            cas = root / "cas_01.cas"
+            cas.write_bytes(b"cas")
+            key = bytes.fromhex("cdb55c0a6ebc15cd")
+
+            source_location = CasLocation(1, cas, 1, 8, 8, b"s" * 20)
+            target_location = CasLocation(1, cas, 2, 8, 8, b"t" * 20)
+            source_item = BundleFile("res", "animation/exm/source", 1, b"", source_location)
+            target_item = BundleFile("res", "hidden/subject_bank", 2, b"", target_location)
+            bundle = BundleInfo("animation/exm/test", sb, 12, (source_item, target_item))
+            source = AssetRecord(
+                path=sb, relative_path="default.sb::animation/exm/source.res",
+                kind="animation", extension=".res", size=8, engine="Frostbite",
+                internal_path="animation/exm/source.res",
+                metadata={
+                    "reader": "frostbite-animation-record", "record_kind": "res",
+                    "bundle_name": bundle.name, "bundle_offset": 12,
+                    "sha1": source_location.sha1.hex(), "cas_id": 1,
+                    "cas_path": str(cas), "cas_offset": 1, "packed_size": 8,
+                    "original_size": 8,
+                },
+            )
+            target_raw = bytearray(128)
+            target_raw[:8] = b"GD.DATAl"
+            struct.pack_into("<I", target_raw, 8, len(target_raw))
+            target_raw[72:80] = key
+            target_raw[96:103] = b"GD.REFL"
+
+            layout = LayoutMap(root, root, None, {}, {1: cas})
+            with patch(
+                "game_asset_explorer.frostbite_index.load_layout_map", return_value=layout,
+            ), patch(
+                "game_asset_explorer.frostbite_index.find_oodle_runtime", return_value=Path("oo2core.dll"),
+            ), patch(
+                "game_asset_explorer.frostbite_index.OodleDecoder", return_value=object(),
+            ), patch(
+                "game_asset_explorer.frostbite_index._toc_paths", return_value=[],
+            ), patch(
+                "game_asset_explorer.frostbite_index.parse_bundle", return_value=bundle,
+            ), patch(
+                "game_asset_explorer.frostbite_index._read_cas", return_value=b"packed",
+            ), patch(
+                "game_asset_explorer.frostbite_index.decode_cas_record", return_value=bytes(target_raw),
+            ):
+                resolved, decoded, scanned, exhaustive = resolve_frostbite_virtual_asset_key(
+                    root, source, key,
+                )
+
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved.internal_path, "hidden/subject_bank.res")
+        self.assertEqual(decoded, bytes(target_raw))
+        self.assertEqual(scanned, 1)
+        self.assertTrue(exhaustive)
+
     def test_animation_record_does_not_mislabel_meshset_in_animation_folder(self) -> None:
         location = CasLocation(1, Path("cas_01.cas"), 0, 8, 8, b"x" * 20)
         mesh = BundleFile(
@@ -50,49 +143,6 @@ class FrostbiteIndexTests(unittest.TestCase):
         )
         self.assertEqual(frostbite_rig_record_kind(skeleton), "skeleton")
         self.assertFalse(is_animation_record(skeleton))
-
-    def test_texture_inside_an_animations_folder_tree_is_a_texture_not_animation(self) -> None:
-        # Regression guard: confirmed on real Anthem data that a character's
-        # head texture is bundled inside an "animations/antanimations/..."
-        # folder tree alongside its facial animations. Before this fix,
-        # frostbite_rig_record_kind had no texture branch at all, so this
-        # kind of file either got misclassified as "animation" (its folder
-        # matched that check) or, outside an animations/ folder, silently
-        # dropped from the scan entirely (rig_kind was None and it isn't a
-        # meshset, so the caller skipped it) -- textures were invisible in
-        # the live app either way, regardless of the (separately fixed, but
-        # never actually called) frostbite.py heuristic.
-        location = CasLocation(1, Path("cas_01.cas"), 0, 8, 8, b"x" * 20)
-        texture = BundleFile(
-            "ebx",
-            "animations/antanimations/humanoids/hmf_abbyneff/head/textures/"
-            "hmf_abbyneff_pcatexture_diffflf_bundlegenbp_bundlegen_win32_antstate",
-            0, b"", location,
-        )
-        self.assertEqual(frostbite_rig_record_kind(texture), "texture")
-        self.assertFalse(is_animation_record(texture))
-
-    def test_real_animation_clip_is_unaffected_by_the_texture_branch(self) -> None:
-        location = CasLocation(1, Path("cas_01.cas"), 0, 8, 8, b"x" * 20)
-        clip = BundleFile(
-            "res",
-            "animations/antanimations/dynamiccontent/actionstations/bwtimelines/exm/"
-            "ast_exm_sentinel_idle_1_bundlegenbp_bundlegen_win32_antstate",
-            0, b"", location,
-        )
-        self.assertEqual(frostbite_rig_record_kind(clip), "animation")
-        self.assertTrue(is_animation_record(clip))
-
-    def test_abbreviated_diffuse_naming_is_recognized_as_texture(self) -> None:
-        # Real Anthem naming abbreviates "diffuse" (diffhf, diffflf) rather
-        # than spelling it out.
-        location = CasLocation(1, Path("cas_01.cas"), 0, 8, 8, b"x" * 20)
-        for suffix in ("diffhf", "diffflf", "diff_hf"):
-            texture = BundleFile(
-                "ebx", f"animations/humanoids/hmf_x/head/textures/hmf_x_pcatexture_{suffix}",
-                0, b"", location,
-            )
-            self.assertEqual(frostbite_rig_record_kind(texture), "texture", msg=suffix)
 
     def test_typed_meshset_and_chunk_locations_are_read_from_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

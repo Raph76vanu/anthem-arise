@@ -3,9 +3,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import permutations
+import math
 import struct
 
-from .frostbite_animation import EclipseAnimationClip, QuaternionChannel
+from .frostbite_animation import EclipseAnimationClip, QuaternionChannel, VectorChannel
 from .frostbite_state import iter_gd_data_blocks
 from .geometry import SkeletonData
 
@@ -30,24 +31,76 @@ class RigamateBoneMapping:
     channel_names: tuple[str, ...]
     skipped_names: tuple[str, ...]
     default_rotations: tuple[tuple[float, float, float, float], ...]
+    vector_channel_indices: tuple[int, ...] = ()
+    vector_bone_indices: tuple[int, ...] = ()
+    vector_channel_names: tuple[str, ...] = ()
+    default_positions: tuple[tuple[float, float, float], ...] = ()
 
     def pose_channels(self, clip: EclipseAnimationClip) -> list[QuaternionChannel]:
-        """Convert keyed rotations to offsets from their bank defaults.
+        """Return the mapped Eclipse rotations in their stored local space.
 
-        Dynamic curves already restore the omitted quaternion component in
-        their decoder. Permuting XYZ here would corrupt legitimate keys when
-        the omitted component changes between frames.
+        Contact sheets from the supplied EXM Twitch clips show that these
+        values replace the skeleton's local bind rotation.  Treating them as
+        offsets from Rigamate defaults folds the body into a compact knot;
+        applying them as absolute local rotations produces a coherent upright
+        figure at every sampled phase.  Keep the original encoding evidence on
+        each channel so later codec work remains independently inspectable.
         """
-        from .frostbite_animation_playback import quaternion_multiply
+        return [clip.quaternion_channels[index] for index in self.channel_indices]
 
-        channels = []
-        for channel_index, default in zip(self.channel_indices, self.default_rotations):
-            source = clip.quaternion_channels[channel_index]
-            inverse = (-default[0], -default[1], -default[2], default[3])
-            values = tuple(quaternion_multiply(inverse, value)
-                           for value in source.values)
-            channels.append(QuaternionChannel(source.times, values))
-        return channels
+    def pose_vector_channels(self, clip: EclipseAnimationClip) -> list[VectorChannel]:
+        """Return mapped translations in their stored local channel space."""
+        return [clip.vector_channels[index] for index in self.vector_channel_indices]
+
+
+def extract_rigamate_mapping_bank(raw: bytes, expected_rig_key: bytes) -> bytes | None:
+    """Keep one RigAsset and only the named DOF sets it references.
+
+    Anthem's PrimaryRig key can resolve to the very large global animation
+    bank containing several Javelin rigs.  Passing that whole resource back
+    to the GUI is wasteful and also makes an unqualified "one rig" check
+    ambiguous.  The selected RigAsset plus its referenced DofSet blocks are
+    self-contained for exact channel-to-joint mapping.
+    """
+    if len(expected_rig_key) != 8:
+        return None
+    blocks = tuple(iter_gd_data_blocks(raw))
+    rigs = [
+        block.body for block in blocks
+        if block.type_hash == 0xB1240F5A
+        and _has_skeleton_name(block.body[:320])
+        and len(block.body) >= 224
+        and block.body[216:224] == expected_rig_key
+    ]
+    if len(rigs) != 1:
+        return None
+    rig = rigs[0]
+    if len(rig) < 192:
+        return None
+    group_count, group_capacity, group_offset = struct.unpack_from("<IIQ", rig, 128)
+    if (group_count != group_capacity or not 1 <= group_count <= 4096
+            or group_offset + 16 + group_count * 8 > len(rig)):
+        return None
+    keys = set(struct.unpack_from(f"<{group_count}Q", rig, group_offset + 16))
+    groups: dict[int, bytes] = {}
+    for block in blocks:
+        if block.type_hash != 0xBB267D6A or len(block.body) <= 104:
+            continue
+        key = struct.unpack_from("<Q", block.body, 88)[0]
+        if key in keys:
+            if key in groups:
+                return None
+            groups[key] = block.body
+    # Some global banks omit an unused set body.  The decoder already rejects
+    # a clip when one of *its* identifiers belongs to a missing set, so retain
+    # the useful partial bank rather than rejecting every clip in the rig.
+    def detached(body: bytes) -> bytes:
+        # GdDataBlock.body follows the declared extent, which in Anthem ends
+        # after the next block's eight-byte tag/reserved prefix.  Remove that
+        # overlap before joining non-adjacent blocks into a compact resource.
+        return body[:-8] if len(body) >= 8 and body[-8:-1] == b"GD.DATA" else body
+
+    return b"".join((detached(rig), *(detached(groups[key]) for key in sorted(groups))))
 
 
 def stabilize_component_swaps(values: tuple[tuple[float, float, float, float], ...]
@@ -81,7 +134,8 @@ def stabilize_component_swaps(values: tuple[tuple[float, float, float, float], .
 
 
 def decode_rigamate_bone_mapping(
-    raw: bytes, clip: EclipseAnimationClip, skeleton: SkeletonData,
+    raw: bytes, clip: EclipseAnimationClip, skeleton: SkeletonData, *,
+    include_constants: bool = False, expected_rig_key: bytes | None = None,
 ) -> RigamateBoneMapping | None:
     """Resolve clip quaternion IDs through RigAsset -> DofSetList -> joint name.
 
@@ -96,28 +150,42 @@ def decode_rigamate_bone_mapping(
     groups: dict[int, bytes] = {}
     for block in iter_gd_data_blocks(raw):
         body = block.body
-        if block.type_hash == 0xB1240F5A and b"EXM_skeleton\0" in body[:320]:
+        if block.type_hash == 0xB1240F5A and _has_skeleton_name(body[:320]):
             rigs.append(body)
         elif block.type_hash == 0xBB267D6A and len(body) > 104:
             key = struct.unpack_from("<Q", body, 88)[0]
             if key in groups:
                 return None
             groups[key] = body
+    if expected_rig_key is not None:
+        if len(expected_rig_key) != 8:
+            return None
+        rigs = [body for body in rigs if len(body) >= 224 and body[216:224] == expected_rig_key]
     if len(rigs) != 1:
         return None
     rig = rigs[0]
     if len(rig) < 192:
         return None
+    # RigAsset.__key occupies byte 216 in the supplied EXM bank. When the
+    # animation explicitly names a PrimaryRigFeature.Rig, do not accept a
+    # bank solely because its DOF names happen to match this skeleton.
+    if expected_rig_key is not None and (
+        len(rig) < 224 or rig[216:224] != expected_rig_key
+    ):
+        return None
     dof_count, dof_capacity, dof_offset = struct.unpack_from("<IIQ", rig, 48)
     quat_count, quat_capacity, quat_offset = struct.unpack_from("<IIQ", rig, 144)
+    vector_count, vector_capacity, vector_offset = struct.unpack_from("<IIQ", rig, 160)
     group_count, group_capacity, group_offset = struct.unpack_from("<IIQ", rig, 128)
     index_count, index_capacity, index_offset = struct.unpack_from("<IIQ", rig, 64)
     if (dof_count != dof_capacity or group_count != group_capacity or
             group_count != index_count or index_count != index_capacity or
-            quat_count != quat_capacity or not 1 <= quat_count <= 100_000 or
+            quat_count != quat_capacity or vector_count != vector_capacity or
+            not 1 <= quat_count <= 100_000 or not 0 <= vector_count <= 100_000 or
             not 1 <= group_count <= 4096 or not 1 <= dof_count <= 100_000 or
             dof_offset + 16 + dof_count * 4 > len(rig) or
             quat_offset + quat_count * 32 > len(rig) or
+            vector_offset + vector_count * 32 > len(rig) or
             group_offset + 16 + group_count * 8 > len(rig) or
             index_offset + 16 + index_count * 4 > len(rig)):
         return None
@@ -132,6 +200,14 @@ def decode_rigamate_bone_mapping(
         if identifier in defaults or not 0.98 <= sum(x * x for x in rotation) <= 1.02:
             return None
         defaults[identifier] = rotation
+    vector_defaults = {}
+    for i in range(vector_count):
+        pos = vector_offset + i * 32
+        identifier = struct.unpack_from("<I", rig, pos)[0]
+        value = struct.unpack_from("<3f", rig, pos + 16)
+        if identifier in vector_defaults or not all(math.isfinite(x) for x in value):
+            return None
+        vector_defaults[identifier] = value
     set_keys = struct.unpack_from(f"<{group_count}Q", rig, group_offset + 16)
     indices = struct.unpack_from(f"<{index_count}I", rig, index_offset + 16)
     if indices[0] != 0 or any(a >= b for a, b in zip(indices, indices[1:])) or indices[-1] >= dof_count:
@@ -191,15 +267,46 @@ def decode_rigamate_bone_mapping(
         if joint in used_bones:
             return None  # multiple curves targeting one joint need blending
         used_bones.add(joint)
-        if clip.quaternion_channels[channel_index].values:
+        if include_constants or clip.quaternion_channels[channel_index].values:
             channel_indices.append(channel_index)
             bone_indices.append(joint)
             channel_names.append(name)
+            # Keep defaults in the same compact order as channel_indices and
+            # bone_indices.  Rigamate contains helper DOFs which are absent
+            # from a render skeleton; appending their defaults here shifted
+            # every later default onto the wrong bone.
             default_rotations.append(defaults[identifier])
+    vector_channel_indices: list[int] = []
+    vector_bone_indices: list[int] = []
+    vector_channel_names: list[str] = []
+    default_positions: list[tuple[float, float, float]] = []
+    used_vector_bones: set[int] = set()
+    vector_ids = clip.dof_ids[
+        len(clip.quaternion_channels):
+        len(clip.quaternion_channels) + len(clip.vector_channels)
+    ]
+    for channel_index, identifier in enumerate(vector_ids):
+        name = resolved[identifier]
+        if "." not in name or identifier not in vector_defaults:
+            return None
+        joint = joints.get(name.rsplit(".", 1)[0])
+        if joint is None:
+            skipped.append(name)
+            continue
+        if joint in used_vector_bones:
+            return None
+        used_vector_bones.add(joint)
+        vector_channel_indices.append(channel_index)
+        vector_bone_indices.append(joint)
+        vector_channel_names.append(name)
+        default_positions.append(vector_defaults[identifier])
     if not channel_indices:
         return None
-    return RigamateBoneMapping(tuple(channel_indices), tuple(bone_indices),
-                               tuple(channel_names), tuple(skipped), tuple(default_rotations))
+    return RigamateBoneMapping(
+        tuple(channel_indices), tuple(bone_indices), tuple(channel_names),
+        tuple(skipped), tuple(default_rotations), tuple(vector_channel_indices),
+        tuple(vector_bone_indices), tuple(vector_channel_names), tuple(default_positions),
+    )
 
 
 def inspect_rigamate_dof_types(raw: bytes, clip: EclipseAnimationClip) -> RigamateDofTypes | None:
@@ -213,9 +320,9 @@ def inspect_rigamate_dof_types(raw: bytes, clip: EclipseAnimationClip) -> Rigama
     name_blocks = []
     dof_blocks = []
     for block in iter_gd_data_blocks(raw):
-        if block.type_hash == 0x14A6DA9B and b"EXM_skeleton\0" in block.body[:160]:
+        if block.type_hash == 0x14A6DA9B and _has_skeleton_name(block.body[:160]):
             name_blocks.append(block.body)
-        elif block.type_hash == 0xB1240F5A and b"EXM_skeleton\0" in block.body[:320]:
+        elif block.type_hash == 0xB1240F5A and _has_skeleton_name(block.body[:320]):
             dof_blocks.append(block.body)
     if len(name_blocks) != 1 or len(dof_blocks) != 1:
         return None
@@ -269,3 +376,18 @@ def inspect_rigamate_dof_types(raw: bytes, clip: EclipseAnimationClip) -> Rigama
             set(f) & (quats | vectors)):
         return None
     return RigamateDofTypes(tuple(names), quats, vectors, q, v, f)
+
+
+def _has_skeleton_name(raw: bytes) -> bool:
+    """Recognize any named Javelin rig, not only Lancer's EXM skeleton.
+
+    Anthem uses the same RigAsset/DofSet layout for EXM, EXF, EXH and EXL,
+    while the embedded object name carries the family prefix.  Requiring the
+    literal ``EXM_skeleton`` made valid Interceptor banks invisible and forced
+    playback onto the unsafe sequential-bone fallback.
+    """
+    lower = raw.lower()
+    return any(marker in lower for marker in (
+        b"exm_skeleton\0", b"exf_skeleton\0",
+        b"exh_skeleton\0", b"exl_skeleton\0",
+    ))

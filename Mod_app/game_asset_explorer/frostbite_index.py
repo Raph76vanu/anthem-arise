@@ -36,6 +36,7 @@ BUNDLE_MAGIC = 0x20
 BUNDLE_META_MAGIC = 0x9D798ED6
 MESHSET_RESOURCE_TYPE = 0x49B156D4
 MAX_BUNDLES_PER_TOC = 100_000
+MAX_CHUNKS_PER_TOC = 1_000_000
 MAX_FILES_PER_BUNDLE = 250_000
 MAX_MESHSETS = 75_000
 MAX_ANIMATION_RECORDS = 50_000
@@ -108,18 +109,6 @@ def frostbite_rig_record_kind(item: BundleFile) -> str | None:
         "skeleton", "bonehierarchy", "/rig/", "_rig/", "_rig.", "_rig_",
     )):
         return "skeleton"
-    # Checked before the "animation" folder-path check below: confirmed on
-    # real Anthem data that a texture reference can sit inside an
-    # "animations/" folder tree (e.g. a character's head texture bundled
-    # alongside its facial animations, such as
-    # ".../head/textures/hmf_x_pcatexture_diffhf_..._antstate.ebx"). Without
-    # this, that file's own specific texture naming loses to the broader
-    # "animations/" folder segment matched below. Real Anthem naming
-    # abbreviates "diffuse" (diffhf, diffflf) rather than spelling it out.
-    if any(token in name for token in (
-        "/texture", "textures/", "pcatexture", "_diffuse", "_normal", "_albedo",
-    )) or base.endswith((".dds", ".png", ".tga", ".texture")):
-        return "texture"
     if (
         name.startswith("animation/")
         or "/animation/" in name
@@ -429,6 +418,64 @@ def iter_toc_bundles(layout: LayoutMap, toc_path: Path):
         yield parse_bundle(layout, sb_path, bundle_offset, name)
 
 
+def iter_toc_chunks(layout: LayoutMap, toc_path: Path):
+    """Yield Anthem's global streamed chunks from a super-bundle TOC.
+
+    Anthem stores large streamed resources (including the highest-detail mesh
+    LODs) in a TOC-level table rather than repeating them in bundle metadata.
+    The table's GUIDs use the byte order consumed by Frosty's Anthem loader.
+    """
+    stream = _toc_payload(toc_path)
+    values = [_u32(stream) for _ in range(12)]
+    if values[0] != INDEX_MAGIC:
+        raise FrostbiteIndexError(f"{toc_path.name} has an unsupported TOC index.")
+    guid_offset, chunk_count, location_offset = values[4], values[5], values[6]
+    length = stream.getbuffer().nbytes
+    if chunk_count > MAX_CHUNKS_PER_TOC:
+        raise FrostbiteIndexError(f"{toc_path.name} exceeds the TOC chunk safety limit.")
+    if not chunk_count:
+        return
+    if (
+        values[3] == 0
+        or guid_offset + chunk_count * 20 > length
+        or location_offset + chunk_count * 12 > length
+    ):
+        raise FrostbiteIndexError(f"{toc_path.name} has an invalid TOC chunk table.")
+
+    chunk_ids: dict[int, bytes] = {}
+    stream.seek(guid_offset)
+    for _ in range(chunk_count):
+        raw_guid = _exact(stream, 16)
+        table_index = _u32(stream) & 0xFFFFFF
+        # Frosty's Anthem loader reverses all 16 bytes before constructing its
+        # System.Guid. Convert that value to UUID network byte order, which is
+        # the representation used by MeshSet declarations in this module.
+        uid = uuid.UUID(bytes_le=raw_guid[::-1]).bytes
+        chunk_ids[table_index // 3] = uid
+
+    stream.seek(location_offset)
+    for index in range(chunk_count):
+        _unknown = _exact(stream, 1)[0]
+        is_patch = _exact(stream, 1)[0] != 0
+        catalog_index = _exact(stream, 1)[0]
+        cas_index = _exact(stream, 1)[0]
+        offset = _u32(stream)
+        packed_size = _u32(stream)
+        uid = chunk_ids.get(index)
+        cas_id = (int(is_patch) << 16) | (catalog_index << 8) | cas_index
+        cas_path = layout.cas_path(cas_id)
+        if (
+            uid is None
+            or cas_path is None
+            or packed_size <= 0
+            or packed_size > MAX_CAS_RECORD
+            or offset + packed_size > cas_path.stat().st_size
+        ):
+            continue
+        location = CasLocation(cas_id, cas_path, offset, packed_size, 0, b"")
+        yield BundleFile("chunk", str(uuid.UUID(bytes=uid)), 0, uid, location)
+
+
 def _toc_paths(layout: LayoutMap) -> list[Path]:
     paths: list[Path] = []
     for layout_root in (layout.data_root, layout.patch_root):
@@ -455,7 +502,7 @@ def _initialize_chunk_database(database: sqlite3.Connection, root: Path) -> None
     )
     database.executemany(
         "INSERT INTO metadata VALUES (?, ?)",
-        (("version", "1"), ("root", str(root.resolve()))),
+        (("version", "2"), ("root", str(root.resolve()))),
     )
 
 
@@ -473,12 +520,18 @@ def save_chunk_index(root: Path, chunks: dict[bytes, BundleFile]) -> None:
     cache.parent.mkdir(parents=True, exist_ok=True)
     temporary = cache.with_suffix(".tmp")
     temporary.unlink(missing_ok=True)
-    with sqlite3.connect(temporary) as database:
+    database = sqlite3.connect(temporary)
+    try:
         _initialize_chunk_database(database, root)
         database.executemany(
             "INSERT OR REPLACE INTO chunks VALUES (?, ?, ?, ?, ?, ?, ?)",
             (_chunk_row(uid, item) for uid, item in chunks.items()),
         )
+        database.commit()
+    finally:
+        # sqlite3's context manager commits/rolls back but does not close the
+        # connection. Windows cannot atomically replace an open database file.
+        database.close()
     temporary.replace(cache)
 
 
@@ -490,7 +543,7 @@ def load_chunk_index(
     try:
         with sqlite3.connect(f"file:{cache}?mode=ro", uri=True) as database:
             metadata = dict(database.execute("SELECT key, value FROM metadata"))
-            if metadata.get("version") != "1" or Path(metadata.get("root", "")).resolve() != root.resolve():
+            if metadata.get("version") != "2" or Path(metadata.get("root", "")).resolve() != root.resolve():
                 return {}
             if requested_uids is None:
                 rows = database.execute(
@@ -602,6 +655,17 @@ def inspect_frostbite_meshsets(root: Path) -> tuple[list[AssetRecord], list[str]
         chunk_database = None
         warnings.append(f"Could not start the Frostbite chunk index: {error}")
     for toc_path in _toc_paths(layout):
+        if chunk_database is not None:
+            try:
+                chunk_database.executemany(
+                    "INSERT OR REPLACE INTO chunks VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (_chunk_row(item.uid, item) for item in iter_toc_chunks(layout, toc_path)),
+                )
+            except (FrostbiteIndexError, OSError) as error:
+                if len(warnings) < 40:
+                    warnings.append(
+                        f"Could not index streamed chunks from {toc_path.relative_to(root)}: {error}"
+                    )
         try:
             for bundle in iter_toc_bundles(layout, toc_path):
                 if chunk_database is not None:
@@ -765,7 +829,7 @@ def _read_cas(location: CasLocation) -> bytes:
         raw = stream.read(location.packed_size)
     if len(raw) != location.packed_size:
         raise MeshFormatError(f"CAS record in {location.cas_path.name} is truncated.")
-    if hashlib.sha1(raw).digest() != location.sha1:
+    if location.sha1 and hashlib.sha1(raw).digest() != location.sha1:
         raise MeshFormatError(f"CAS record hash mismatch in {location.cas_path.name}.")
     return raw
 
@@ -792,6 +856,167 @@ def extract_frostbite_record(root: Path, asset: AssetRecord) -> bytes:
     return decode_cas_record(
         _read_cas(location), oodle, max_output_bytes=MAX_CAS_RECORD,
     )
+
+
+def count_frostbite_animation_records(
+    root: Path, assets: list[AssetRecord],
+) -> list[int | None]:
+    """Count clips in many RES records with one Oodle decoder instance.
+
+    Counts only Gameplay Data object headers. Curve values, Rigamate banks,
+    skeleton mappings, and playback state are deliberately not decoded.
+    ``None`` marks a record which could not be safely inspected.
+    """
+    from .frostbite_animation import count_anthem_animation_clips
+    from .frostbite_state import is_antstate_resource
+
+    oodle = OodleDecoder(find_oodle_runtime(root))
+    counts: list[int | None] = []
+    for asset in assets:
+        try:
+            if (asset.metadata.get("reader") != "frostbite-animation-record"
+                    or asset.extension.casefold() != ".res"):
+                counts.append(None)
+                continue
+            location = _location_from_asset(asset)
+            raw = decode_cas_record(
+                _read_cas(location), oodle, max_output_bytes=MAX_CAS_RECORD,
+            )
+            counts.append(
+                count_anthem_animation_clips(raw) if is_antstate_resource(raw) else 0
+            )
+        except (FrostbiteCasError, MeshFormatError, OSError, ValueError):
+            counts.append(None)
+    return counts
+
+
+def resolve_frostbite_virtual_asset_key(
+    root: Path, asset: AssetRecord, key: bytes, *, max_records: int = 50_000,
+) -> tuple[AssetRecord | None, bytes | None, int, bool]:
+    """Resolve an eight-byte Gameplay Data virtual-asset key across RES files.
+
+    Anthem's BankPointer names are authored object labels, not archive paths.
+    Their SubjectBankAsset fields therefore have to be matched against decoded
+    GD.DATA resources. The owning bundle and Javelin-family bundles are searched
+    first, then the remaining installation metadata. The returned boolean says
+    whether the search was exhaustive rather than stopped by ``max_records``.
+    """
+    if len(key) != 8:
+        raise MeshFormatError("A Gameplay Data virtual-asset key must be exactly eight bytes.")
+    if max_records <= 0:
+        raise MeshFormatError("The virtual-asset search limit must be positive.")
+
+    from .frostbite_animation import has_gd_data_asset_key
+    from .frostbite_state import is_antstate_resource
+
+    layout = load_layout_map(root)
+    oodle = OodleDecoder(find_oodle_runtime(root))
+    current_key = (asset.path.resolve(), int(asset.metadata.get("bundle_offset", -1)))
+    family = ""
+    normalized_source = (asset.internal_path or "").replace("\\", "/").casefold()
+    source_parts = [part for part in normalized_source.split("/") if part]
+    if "animation" in source_parts:
+        family_index = source_parts.index("animation") + 1
+        if family_index < len(source_parts):
+            family = source_parts[family_index]
+
+    references: list[tuple[str, Path, int]] = []
+    seen_bundle_refs: set[tuple[Path, int]] = set()
+    if current_key[1] >= 0:
+        references.append((str(asset.metadata.get("bundle_name", "")), asset.path, current_key[1]))
+        seen_bundle_refs.add(current_key)
+    for toc_path in _toc_paths(layout):
+        try:
+            for name, sb_path, offset in iter_toc_bundle_refs(layout, toc_path):
+                reference_key = (sb_path.resolve(), offset)
+                if reference_key in seen_bundle_refs:
+                    continue
+                seen_bundle_refs.add(reference_key)
+                references.append((name, sb_path, offset))
+        except (FrostbiteIndexError, OSError):
+            continue
+
+    def priority(reference: tuple[str, Path, int]) -> tuple[int, str, int]:
+        name, path, offset = reference
+        folded = name.replace("\\", "/").casefold()
+        if (path.resolve(), offset) == current_key:
+            rank = 0
+        elif family and any(part == family for part in folded.split("/")):
+            rank = 1
+        elif family and family in folded:
+            rank = 2
+        elif "animation" in folded or "/anim" in folded:
+            rank = 3
+        else:
+            rank = 4
+        return rank, folded, offset
+
+    references.sort(key=priority)
+    source_sha1 = str(asset.metadata.get("sha1", "")).casefold()
+    seen_records: set[tuple[bytes, str]] = set()
+    scanned = 0
+    exhaustive = True
+    for bundle_name, sb_path, bundle_offset in references:
+        try:
+            bundle = parse_bundle(layout, sb_path, bundle_offset, bundle_name)
+        except (FrostbiteIndexError, OSError):
+            continue
+        for index, item in enumerate(bundle.files):
+            if item.kind != "res" or item.resource_type == MESHSET_RESOURCE_TYPE:
+                continue
+            record_key = (item.location.sha1, item.name.casefold())
+            if record_key in seen_records:
+                continue
+            seen_records.add(record_key)
+            if item.location.sha1.hex().casefold() == source_sha1:
+                continue
+            if scanned >= max_records:
+                exhaustive = False
+                return None, None, scanned, exhaustive
+            scanned += 1
+            try:
+                decoded = decode_cas_record(
+                    _read_cas(item.location), oodle, max_output_bytes=MAX_CAS_RECORD,
+                )
+            except (FrostbiteCasError, MeshFormatError, OSError, ValueError):
+                continue
+            if key not in decoded or not is_antstate_resource(decoded):
+                continue
+            try:
+                if not has_gd_data_asset_key(decoded, key):
+                    continue
+            except MeshFormatError:
+                continue
+            try:
+                relative_container = str(bundle.sb_path.relative_to(root))
+            except ValueError:
+                relative_container = str(bundle.sb_path)
+            internal = f"{item.name}.res"
+            resolved = AssetRecord(
+                path=bundle.sb_path,
+                relative_path=f"{relative_container}::{internal}",
+                kind="animation", extension=".res", size=item.location.original_size,
+                engine="Frostbite", directly_viewable=False,
+                container_path=bundle.sb_path, internal_path=internal,
+                metadata={
+                    "reader": "frostbite-animation-record",
+                    "record_kind": "res",
+                    "classification": "resolved-virtual-animation-bank",
+                    "virtual_asset_key": key.hex(),
+                    "referenced_by": asset.internal_path,
+                    "bundle_name": bundle.name,
+                    "bundle_offset": bundle.offset,
+                    "resource_index": index,
+                    "cas_id": item.location.cas_id,
+                    "cas_path": str(item.location.cas_path),
+                    "cas_offset": item.location.offset,
+                    "packed_size": item.location.packed_size,
+                    "original_size": item.location.original_size,
+                    "sha1": item.location.sha1.hex(),
+                },
+            )
+            return resolved, decoded, scanned, exhaustive
+    return None, None, scanned, exhaustive
 
 
 def extract_frostbite_ebx_dependencies(

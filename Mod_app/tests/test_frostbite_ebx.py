@@ -70,6 +70,8 @@ class FrostbiteEbxTests(unittest.TestCase):
         identity = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
                     0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         child = identity.copy()
+        # A local 90-degree Z rotation, stored as three column vectors.
+        child[0], child[1], child[4], child[5] = 0.0, 1.0, -1.0, 0.0
         child[12] = 1.0
         for offset in (16, 144, 272):
             struct.pack_into("<16f", raw, arrays_base + offset, *identity)
@@ -84,8 +86,9 @@ class FrostbiteEbxTests(unittest.TestCase):
         self.assertEqual(len(rotations), 2)
         for x, y, z, w in rotations:
             self.assertAlmostEqual(x * x + y * y + z * z + w * w, 1.0, places=5)
-            # every candidate array here uses an identity rotation submatrix
-            self.assertAlmostEqual(w, 1.0, places=5)
+        self.assertAlmostEqual(rotations[0][3], 1.0, places=5)
+        self.assertAlmostEqual(rotations[1][2], math.sqrt(0.5), places=5)
+        self.assertAlmostEqual(rotations[1][3], math.sqrt(0.5), places=5)
 
     def test_rotation_matrix_to_quaternion_round_trips_a_known_rotation(self) -> None:
         # A 90 degree rotation around Z: x'=-y, y'=x, z'=z (row-major).

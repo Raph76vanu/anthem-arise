@@ -38,17 +38,17 @@ class App(tk.Tk):
         self.path_var = tk.StringVar()
         self.show_all_var = tk.BooleanVar(value=False)
         self.lod0_only_var = tk.BooleanVar(value=False)
+        self.animation_res_only_var = tk.BooleanVar(value=False)
+        self.animation_clip_search_var = tk.BooleanVar(value=False)
+        self._animation_clip_indexing = False
         self.category_var = tk.StringVar(value=self.CATEGORY_OPTIONS[0])
         self.search_var = tk.StringVar()
         self.exclude_search_var = tk.StringVar()
-        self.animation_res_only_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Choose a legally obtained game installation folder.")
         self._displayed_bundles = []
         self._archive_previews = {}
         self._indexed_archives: set[Path] = set()
         self._indexing_categories: set[str] = set()
-        self._preview_running = False
-        self._pending_preview: tuple[object, str] | None = None
         self._unity_indexed_categories: set[str] = set()
         self._frostbite_inventory_started = False
         self._search_after_id = None
@@ -60,13 +60,24 @@ class App(tk.Tk):
         self._rig_report: dict[str, object] | None = None
         self._rig_asset = None
         self._frostbite_skeleton_cache = {}
+        self._frostbite_virtual_asset_cache = {}
         self._preview_character: dict[str, object] | None = None
+        self._assembly_source = None
         self._active_character: dict[str, object] | None = None
         self._active_animation: dict[str, object] | None = None
         self._animation_after_id: str | None = None
         self._animation_start_time: float | None = None
         self._last_animation_phase: float = 0.0
         self._animation_playback: dict[str, object] | None = None
+        self._animation_generation = 0
+        self._animation_skin_running = False
+        self._video_export_running = False
+        self._resolved_rigamate_asset = None
+        self._resolved_rigamate_raw: bytes | None = None
+        # Verified family banks can also help preview later configuration RES
+        # files which contain curves but omit their own bank pointer.
+        self._rigamate_bank_cache: dict[str, tuple[object, bytes]] = {}
+        self._primary_rig_bank_cache: dict[str, tuple[object, bytes, bytes]] = {}
         self.use_for_animation_var = tk.BooleanVar(value=False)
         self.active_character_var = tk.StringVar(value="No active character")
         self.animation_clip_var = tk.StringVar(value="Animation: none selected")
@@ -75,11 +86,20 @@ class App(tk.Tk):
         self.animation_filter_unhealthy_var = tk.BooleanVar(value=True)
         self.animation_group_var = tk.StringVar()
         self._animation_group_options: list[dict[str, object]] = []
-        self._bank_search_cancelled = False
-        self._bank_search_running = False
-        self._loaded_banks: dict[str, bytes] = {}
-        self.use_real_mapping_var = tk.BooleanVar(value=False)
+        self.animation_clip_filter_var = tk.StringVar()
+        self.animation_clip_match_var = tk.StringVar(value="")
+        self._animation_clip_search_cursor: int | None = None
         self.animation_speed_var = tk.StringVar(value="1.0×")
+        self._prototype_running = False
+        self._prototype_controller = None
+        self._prototype_after_id: str | None = None
+        self._prototype_last_time: float | None = None
+        self._prototype_held: set[str] = set()
+        self._prototype_pressed: set[str] = set()
+        self._prototype_animation_cache: dict[int, dict[str, object]] = {}
+        self._prototype_clip_index: int | None = None
+        self._prototype_global_lod = 5
+        self._standalone_export_running = False
         self._build()
 
     def _build(self) -> None:
@@ -109,7 +129,19 @@ class App(tk.Tk):
             filter_bar, text="LOD0 available only", variable=self.lod0_only_var,
             command=self._refresh_result,
         ).pack(side="left", padx=(12, 0))
-        ttk.Label(filter_bar, text="Search:").pack(side="left", padx=(18, 0))
+        self.search_label = ttk.Label(filter_bar, text="Search:")
+        self.search_label.pack(side="left", padx=(18, 0))
+        self.animation_res_only_checkbox = ttk.Checkbutton(
+            filter_bar, text=".res only", variable=self.animation_res_only_var,
+            command=self._refresh_result,
+        )
+        self.animation_clip_search_checkbox = ttk.Checkbutton(
+            filter_bar, text="Search clip names", variable=self.animation_clip_search_var,
+            command=self._refresh_result,
+        )
+        self.animation_count_button = ttk.Button(
+            filter_bar, text="Count clips", command=self._count_animation_clips,
+        )
         search_entry = ttk.Entry(filter_bar, textvariable=self.search_var, width=26)
         search_entry.pack(side="left", padx=(8, 0), fill="x", expand=True)
         search_entry.bind("<KeyRelease>", self._schedule_search_refresh)
@@ -117,11 +149,6 @@ class App(tk.Tk):
         exclude_entry = ttk.Entry(filter_bar, textvariable=self.exclude_search_var, width=26)
         exclude_entry.pack(side="left", padx=(8, 0), fill="x", expand=True)
         exclude_entry.bind("<KeyRelease>", self._schedule_search_refresh)
-        self.animation_res_only_checkbox = ttk.Checkbutton(
-            filter_bar, text=".res only", variable=self.animation_res_only_var,
-            command=self._refresh_result,
-        )
-        self.animation_res_only_checkbox.pack(side="left", padx=(12, 0))
 
         self.folder_scope = ttk.Frame(self, padding=(12, 0, 12, 8))
         self.folder_scope_var = tk.StringVar()
@@ -137,6 +164,10 @@ class App(tk.Tk):
         self.animation_bar_row1.pack(side="top", fill="x")
         self.animation_bar_row2 = ttk.Frame(self.animation_bar)
         self.animation_bar_row2.pack(side="top", fill="x", pady=(4, 0))
+        self.animation_bar_row3 = ttk.Frame(self.animation_bar)
+        self.animation_bar_row3.pack(side="top", fill="x", pady=(4, 0))
+        self.animation_bar_row4 = ttk.Frame(self.animation_bar)
+        self.animation_bar_row4.pack(side="top", fill="x", pady=(4, 0))
         ttk.Label(
             self.animation_bar_row1, textvariable=self.active_character_var,
             foreground="#176b3a",
@@ -154,6 +185,16 @@ class App(tk.Tk):
             state="disabled",
         )
         self.animation_stop_button.pack(side="left", padx=4)
+        self.prototype_button = ttk.Button(
+            self.animation_bar_row1, text="Play prototype",
+            command=self._toggle_interceptor_prototype, state="disabled",
+        )
+        self.prototype_button.pack(side="left", padx=4)
+        self.prototype_export_button = ttk.Button(
+            self.animation_bar_row1, text="Export standalone…",
+            command=self._export_standalone_prototype, state="disabled",
+        )
+        self.prototype_export_button.pack(side="left", padx=4)
         ttk.Label(
             self.animation_bar_row1, textvariable=self.animation_state_var,
             foreground="#6b7280",
@@ -175,6 +216,16 @@ class App(tk.Tk):
             state="disabled",
         )
         self.animation_health_button.pack(side="left", padx=4)
+        self.animation_video_button = ttk.Button(
+            self.animation_bar_row2, text="Save animation video…",
+            command=self._save_animation_video, state="disabled",
+        )
+        self.animation_video_button.pack(side="left", padx=4)
+        self.rigamate_extract_button = ttk.Button(
+            self.animation_bar_row2, text="Extract Rigamate bank…",
+            command=self._extract_resolved_rigamate_bank, state="disabled",
+        )
+        self.rigamate_extract_button.pack(side="left", padx=4)
         self.animation_loop_checkbox = ttk.Checkbutton(
             self.animation_bar_row2, text="Loop", variable=self.animation_loop_var,
             state="disabled",
@@ -185,25 +236,52 @@ class App(tk.Tk):
             state="disabled",
         )
         self.animation_filter_checkbox.pack(side="left", padx=4)
-        self.animation_group_combo = ttk.Combobox(
-            self.animation_bar_row2, textvariable=self.animation_group_var,
-            state="disabled", width=55,
-        )
-        self.animation_group_combo.pack(side="left", padx=4)
-        self.animation_group_combo.bind("<<ComboboxSelected>>", self._on_animation_group_selected)
         ttk.Label(self.animation_bar_row2, textvariable=self.animation_speed_var).pack(
             side="left", padx=4,
         )
-        self.bank_search_button = ttk.Button(
-            self.animation_bar_row2, text="Find external bank…", command=self._start_bank_search,
+        ttk.Label(self.animation_bar_row3, text="Clip:").pack(side="left", padx=(0, 4))
+        self.animation_group_combo = ttk.Combobox(
+            self.animation_bar_row3, textvariable=self.animation_group_var,
+            state="disabled", width=70,
+        )
+        self.animation_group_combo.pack(side="left", fill="x", expand=True)
+        self.animation_group_combo.bind("<<ComboboxSelected>>", self._on_animation_group_selected)
+        self.animation_clip_position_var = tk.StringVar(value="0 / 0")
+        ttk.Label(self.animation_bar_row3, textvariable=self.animation_clip_position_var).pack(
+            side="left", padx=(8, 4),
+        )
+        self.animation_previous_button = ttk.Button(
+            self.animation_bar_row3, text="◀ Previous", command=lambda: self._step_animation_group(-1),
             state="disabled",
         )
-        self.bank_search_button.pack(side="left", padx=4)
-        self.use_real_mapping_checkbox = ttk.Checkbutton(
-            self.animation_bar_row2, text="Use real bank mapping", variable=self.use_real_mapping_var,
-            state="disabled", command=self._on_real_mapping_toggle,
+        self.animation_previous_button.pack(side="left", padx=3)
+        self.animation_next_button = ttk.Button(
+            self.animation_bar_row3, text="Next ▶", command=lambda: self._step_animation_group(1),
+            state="disabled",
         )
-        self.use_real_mapping_checkbox.pack(side="left", padx=4)
+        self.animation_next_button.pack(side="left", padx=3)
+        ttk.Label(self.animation_bar_row4, text="Find clip:").pack(side="left", padx=(0, 4))
+        self.animation_clip_filter_entry = ttk.Entry(
+            self.animation_bar_row4, textvariable=self.animation_clip_filter_var, width=36,
+        )
+        self.animation_clip_filter_entry.pack(side="left", fill="x", expand=True)
+        self.animation_clip_filter_entry.bind("<KeyRelease>", self._update_clip_search_matches)
+        self.animation_clip_filter_entry.bind("<Return>", lambda _event: self._step_clip_search(1))
+        self.animation_clip_filter_entry.bind("<Shift-Return>", lambda _event: self._step_clip_search(-1))
+        ttk.Label(
+            self.animation_bar_row4, textvariable=self.animation_clip_match_var, width=16,
+            anchor="center",
+        ).pack(side="left", padx=(8, 4))
+        self.animation_clip_match_previous_button = ttk.Button(
+            self.animation_bar_row4, text="◀ Match",
+            command=lambda: self._step_clip_search(-1), state="disabled",
+        )
+        self.animation_clip_match_previous_button.pack(side="left", padx=3)
+        self.animation_clip_match_next_button = ttk.Button(
+            self.animation_bar_row4, text="Next match ▶",
+            command=lambda: self._step_clip_search(1), state="disabled",
+        )
+        self.animation_clip_match_next_button.pack(side="left", padx=3)
 
         pane = ttk.Panedwindow(self, orient="horizontal")
         self.pane = pane
@@ -234,24 +312,31 @@ class App(tk.Tk):
         ).grid(row=0, column=0, sticky="ew", padx=(0, 8))
         self.preview_button = ttk.Button(bottom, text="Preview", command=self.preview_selected)
         self.preview_button.grid(row=0, column=1, padx=(0, 8))
+        self.assemble_button = ttk.Button(
+            bottom, text="Assemble cosmetics", command=self._assemble_high_detail,
+            state="disabled",
+        )
+        self.assemble_button.grid(row=0, column=2, padx=(0, 8))
         self.use_for_animation_check = ttk.Checkbutton(
             bottom, text="Use for animation", variable=self.use_for_animation_var,
             command=self._toggle_active_character, state="disabled",
         )
-        self.use_for_animation_check.grid(row=0, column=2, padx=(0, 8))
+        self.use_for_animation_check.grid(row=0, column=3, padx=(0, 8))
         self.rig_button = ttk.Button(
             bottom, text="Inspect rig…", command=self.show_rig_inspector, state="disabled",
         )
-        self.rig_button.grid(row=0, column=3, padx=(0, 8))
+        self.rig_button.grid(row=0, column=4, padx=(0, 8))
         ttk.Button(
             bottom, text="Extract selected…", command=self.extract_selected,
-        ).grid(row=0, column=4, padx=(0, 8))
+        ).grid(row=0, column=5, padx=(0, 8))
         ttk.Button(
             bottom, text="Export report…", command=self.export_report,
-        ).grid(row=0, column=5, padx=(0, 8))
+        ).grid(row=0, column=6, padx=(0, 8))
         ttk.Button(bottom, text="Notices…", command=self.show_notices).grid(
-            row=0, column=6,
+            row=0, column=7,
         )
+        self.bind_all("<KeyPress>", self._prototype_key_press, add="+")
+        self.bind_all("<KeyRelease>", self._prototype_key_release, add="+")
 
     def choose(self) -> None:
         chosen = filedialog.askdirectory(title="Choose game installation")
@@ -260,24 +345,201 @@ class App(tk.Tk):
 
     @staticmethod
     def _javelin_family(asset) -> str | None:
-        """Despite the name (kept for compatibility), this now infers a
-        general character/creature family, not just Javelins -- see
-        _infer_character_family for why the naming convention generalizes.
-        Only searches directory segments, not the filename itself -- a
-        filename's own first underscore-separated word (e.g. "ast" in
-        "ast_exm_sentinel_idle...") would otherwise be found after, and so
-        override, the real family folder (e.g. "exm") when only the last
-        match is kept.
+        """Use explicit rig folders and Javelin aliases, not arbitrary words.
+
+        Gameplay folders such as ``beam`` or ``wrist`` are not skeleton
+        families. An unknown animation family is safer than a false mismatch.
         """
         value = (asset.internal_path or asset.relative_path).replace("\\", "/").casefold()
         directory = (value.rsplit("/", 1)[0] if "/" in value else "") + "/"
-        matches = re.findall(r"(?:^|/)([a-z]{2,8})(?=_|/)", directory)
-        specific = [family for family in matches if family != "exo"]
-        return specific[-1] if specific else None
+        segments = directory.strip("/").split("/")
+        # "exo" is a generic archive directory, not the EXO Javelin rig.
+        explicit = [match.group(1) for segment in segments if segment != "exo"
+                    if (match := re.match(r"^(ex[a-z])(?:_|$)", segment))]
+        if explicit:
+            return explicit[-1]
+        # Player-preview AntState records live directly under exo/playerpreview;
+        # their filename, rather than a family folder, carries the exact rig.
+        # Require the known family and Javelin name to agree before allowing
+        # playback, since a mistaken match can distort the posed character.
+        if "exo" in segments and asset.kind == "animation":
+            filename = value.rsplit("/", 1)[-1]
+            for family, name in (("exm", "lancer"), ("exh", "colossus"),
+                                 ("exf", "interceptor"), ("exl", "storm")):
+                if filename.startswith(f"{family}_{name}_"):
+                    return family
+        aliases = {"lancer": "exm", "colossus": "exh",
+                   "interceptor": "exf", "storm": "exl"}
+        for segment in segments:
+            if segment in aliases:
+                return aliases[segment]
+        # Preserve the existing creature mesh convention (ara_worker, etc.)
+        # without treating animation action/equipment folders as rig IDs.
+        if asset.kind in {"mesh", "skeleton"}:
+            for segment in segments:
+                match = re.match(r"^([a-z]{2,8})_[a-z]", segment)
+                if match and match.group(1) not in {"exo", "animation", "animations"}:
+                    return match.group(1)
+        return None
 
     def _category_changed(self, _event=None) -> None:
+        if self.category_var.get() == "Animations":
+            self.animation_res_only_checkbox.pack(
+                side="left", padx=(12, 0), before=self.search_label,
+            )
+            self.animation_clip_search_checkbox.pack(
+                side="left", padx=(8, 0), before=self.search_label,
+            )
+            self.animation_count_button.pack(
+                side="left", padx=(8, 0), before=self.search_label,
+            )
+        else:
+            self.animation_res_only_checkbox.pack_forget()
+            self.animation_clip_search_checkbox.pack_forget()
+            self.animation_count_button.pack_forget()
         self._refresh_result()
         self._update_animation_bar()
+
+    @staticmethod
+    def _animation_res_visible(category: str, res_only: bool, asset) -> bool:
+        return (category != "Animations" or not res_only
+                or asset.extension.casefold() == ".res")
+
+    @staticmethod
+    def _animation_display_count(bundle) -> int | str:
+        """Show decoded clips, not the number of files represented by a row."""
+        asset = bundle.mesh
+        if asset.kind != "animation":
+            return bundle.count("animation")
+        if "decoded_clip_count" in asset.metadata:
+            try:
+                return max(0, int(asset.metadata["decoded_clip_count"]))
+            except (TypeError, ValueError):
+                pass
+        if "clip_names" in asset.metadata:
+            names = asset.metadata.get("clip_names")
+            if isinstance(names, (tuple, list)):
+                return len(names)
+        if (asset.metadata.get("reader") == "frostbite-animation-record"
+                and asset.extension.casefold() == ".res"):
+            return "…"
+        return bundle.count("animation")
+
+    def _update_animation_count_cell(self, asset) -> None:
+        for index, bundle in enumerate(self._displayed_bundles):
+            candidate = bundle.mesh
+            if not (candidate is asset or (
+                candidate.path == asset.path
+                and candidate.internal_path == asset.internal_path
+            )):
+                continue
+            row = f"bundle-{index}"
+            if not self.tree.exists(row):
+                return
+            values = list(self.tree.item(row, "values"))
+            if len(values) >= 4:
+                values[3] = self._animation_display_count(bundle)
+                self.tree.item(row, values=values)
+            return
+
+    @staticmethod
+    def _asset_matches_search(asset, include_terms: tuple[str, ...],
+                              exclude_terms: tuple[str, ...]) -> bool:
+        haystack = " ".join((
+            asset.relative_path,
+            asset.internal_path or "",
+            str(asset.metadata.get("bundle_name", "")),
+            " ".join(str(name) for name in asset.metadata.get("clip_names", ())),
+        )).casefold()
+        return (all(term in haystack for term in include_terms)
+                and not any(term in haystack for term in exclude_terms))
+
+    def _start_animation_clip_index(self, assets) -> None:
+        if self._animation_clip_indexing or not self.result:
+            return
+        candidates = [asset for asset in assets
+                      if asset.extension.casefold() == ".res"
+                      and asset.metadata.get("reader") == "frostbite-animation-record"
+                      and "clip_names" not in asset.metadata]
+        if not candidates:
+            return
+        self._animation_clip_indexing = True
+        self.animation_count_button.configure(state="disabled")
+        self.status_var.set(f"Indexing clip names in {len(candidates):,} animation records…")
+        root = self.result.engine_root or self.result.root
+
+        def worker():
+            indexed = 0
+            try:
+                from .frostbite import extract_frostbite_record_isolated
+                from .frostbite_animation import decode_anthem_animation_stream
+                from .frostbite_state import is_antstate_resource
+                for asset in candidates:
+                    try:
+                        raw = extract_frostbite_record_isolated(root, asset)
+                        names = tuple(clip.name for clip in decode_anthem_animation_stream(raw)) \
+                            if is_antstate_resource(raw) else ()
+                        asset.metadata["clip_names"] = names
+                        asset.metadata["decoded_clip_count"] = len(names)
+                        indexed += 1
+                    except Exception:
+                        asset.metadata["clip_names"] = ()
+            finally:
+                self.after(0, self._finish_animation_clip_index, indexed)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_animation_clip_index(self, indexed: int) -> None:
+        self._animation_clip_indexing = False
+        self.animation_count_button.configure(state="normal")
+        self.status_var.set(f"Indexed clip names in {indexed:,} animation records.")
+        self._refresh_result()
+
+    def _count_animation_clips(self) -> None:
+        if self._animation_clip_indexing or not self.result:
+            return
+        candidates = [
+            asset for asset in self.result.assets
+            if asset.extension.casefold() == ".res"
+            and asset.metadata.get("reader") == "frostbite-animation-record"
+            and "decoded_clip_count" not in asset.metadata
+        ]
+        if not candidates:
+            self.status_var.set("All indexed animation RES records already have clip counts.")
+            return
+        self._animation_clip_indexing = True
+        self.animation_count_button.configure(state="disabled")
+        self.status_var.set(
+            f"Counting clips in {len(candidates):,} animation records in the background…"
+        )
+        root = self.result.engine_root or self.result.root
+
+        def worker() -> None:
+            try:
+                from .frostbite import count_frostbite_animation_clips_isolated
+                counts = count_frostbite_animation_clips_isolated(root, candidates)
+                self.after(0, self._finish_animation_clip_count, candidates, counts, None)
+            except Exception as error:
+                self.after(0, self._finish_animation_clip_count, candidates, [], error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_animation_clip_count(self, candidates, counts, error) -> None:
+        self._animation_clip_indexing = False
+        self.animation_count_button.configure(state="normal")
+        if error is not None:
+            self.status_var.set(f"Animation clip counting failed safely: {error}")
+            return
+        resolved = 0
+        for asset, count in zip(candidates, counts):
+            if count is None:
+                continue
+            asset.metadata["decoded_clip_count"] = int(count)
+            resolved += 1
+        self._refresh_result()
+        self.status_var.set(
+            f"Clip counts loaded for {resolved:,}/{len(candidates):,} animation records."
+        )
 
     def _update_animation_bar(self) -> None:
         visible = self._active_character is not None or self.category_var.get() == "Animations"
@@ -288,6 +550,8 @@ class App(tk.Tk):
             self.animation_bar.pack_forget()
 
     def _toggle_active_character(self) -> None:
+        if self._prototype_running and not self.use_for_animation_var.get():
+            self._stop_interceptor_prototype()
         if self.use_for_animation_var.get():
             candidate = self._preview_character
             if candidate is None:
@@ -316,7 +580,9 @@ class App(tk.Tk):
             self.animation_state_var.set("Select a rigged mesh and enable Use for animation.")
             self.animation_play_button.configure(state="disabled")
             self.animation_stop_button.configure(state="disabled")
+            self.animation_video_button.configure(state="disabled")
         self._update_animation_bar()
+        self._update_prototype_button()
         if self.category_var.get() == "Animations":
             self._refresh_result()
 
@@ -344,240 +610,72 @@ class App(tk.Tk):
             return f"{clip_family} mismatch", False
         return "compatibility unknown", None
 
-    def _start_bank_search(self) -> None:
-        if self._bank_search_running or self.result is None or self._active_animation is None:
-            return
-        pointers = self._active_animation.get("external_bank_pointers") or []
-        if not pointers:
-            return
-        # If more than one external pointer exists, search for all of them in
-        # one pass rather than making the person choose -- each is a distinct
-        # 8-byte key, so there's no ambiguity in checking for both at once.
-        candidates = [
-            asset for asset in self.result.assets
-            if asset.metadata.get("reader") in {"frostbite-animation-record", "frostbite-skeleton-record"}
-        ]
-        self._bank_search_running = True
-        self._bank_search_cancelled = False
-        self.bank_search_button.configure(text="Stop search", state="normal", command=self._cancel_bank_search)
-        self.status_var.set(f"Searching {len(candidates):,} indexed animation/skeleton records for {len(pointers)} bank key(s)...")
-        threading.Thread(
-            target=self._bank_search_worker, args=(pointers, candidates), daemon=True,
-        ).start()
-
-    def _cancel_bank_search(self) -> None:
-        self._bank_search_cancelled = True
-
-    def _bank_search_worker(self, pointers, candidates) -> None:
-        from .frostbite_animation import has_gd_data_asset_key
-        from .frostbite_index import extract_frostbite_record
-        root = self.result.engine_root or self.result.root
-        matches: dict[str, list[str]] = {p.name: [] for p in pointers}
-        searched = 0
-        errors = 0
-        for index, asset in enumerate(candidates, 1):
-            if self._bank_search_cancelled:
-                break
-            searched += 1
-            if index % 25 == 0 or index == len(candidates):
-                self.after(
-                    0, self.status_var.set,
-                    f"Searching for external bank(s): {index:,}/{len(candidates):,} records checked, "
-                    f"{sum(len(v) for v in matches.values())} match(es) so far...",
-                )
-            try:
-                raw = extract_frostbite_record(root, asset)
-            except Exception:
-                errors += 1
-                continue
-            for pointer in pointers:
-                # Fast substring pre-filter before the more careful,
-                # structure-aware check -- avoids doing real parsing work on
-                # the vast majority of files that don't even contain the
-                # byte pattern anywhere.
-                if pointer.subject_key not in raw:
-                    continue
-                if has_gd_data_asset_key(raw, pointer.subject_key):
-                    matches[pointer.name].append(asset.relative_path)
-                    if pointer.name not in self._loaded_banks:
-                        # Cache the first match's bytes -- already have them
-                        # in memory right here, no need to re-extract later.
-                        self._loaded_banks[pointer.name] = raw
-        self.after(0, self._finish_bank_search, matches, searched, errors)
-
-    def _finish_bank_search(self, matches: dict[str, list[str]], searched: int, errors: int) -> None:
-        self._bank_search_running = False
-        self.bank_search_button.configure(command=self._start_bank_search)
-        total_matches = sum(len(v) for v in matches.values())
-        cancelled_note = " (search stopped early)" if self._bank_search_cancelled else ""
-
-        from datetime import datetime
-        from pathlib import Path
-        animation_name = self._active_animation.get("name", "?") if self._active_animation else "?"
-        lines = [
-            f"Animation: {animation_name}",
-            f"Records searched: {searched:,}{cancelled_note}",
-            f"Records that failed to extract/read: {errors:,}",
-            "",
-            "NOTE: the paths below are internal locations INSIDE Anthem's packed",
-            "archive files (.sb/.cas), not real folders on your hard drive -- you",
-            "won't find them in Windows Explorer. To get one of these files: in the",
-            "app, set Asset category to \"All\", search for a distinctive part of the",
-            "filename (e.g. \"boot_win32_antstate\"), select the matching row, and",
-            "click \"Extract selected...\".",
-            "",
-        ]
-        for name, files in matches.items():
-            lines.append(f"{name}: {len(files)} match(es)")
-            for path in files:
-                lines.append(f"  {path}")
-            if not files:
-                lines.append("  (no match found)")
-            lines.append("")
-        text = "\n".join(lines)
-
-        out_path = None
-        try:
-            out_dir = Path.home() / "Desktop"
-            if not out_dir.is_dir():
-                out_dir = Path.cwd()
-            out_path = out_dir / f"bank_search_{datetime.now():%Y%m%d_%H%M%S}.txt"
-            out_path.write_text(text, encoding="utf-8")
-        except OSError as error:
-            self.status_var.set(f"Search finished but could not write results file: {error}")
-
-        if out_path is not None:
-            if total_matches == 0:
-                self.status_var.set(
-                    f"Searched {searched:,} records{cancelled_note}, no matches -- wrote details to {out_path}"
-                )
-            else:
-                self.status_var.set(
-                    f"Searched {searched:,} records{cancelled_note}, {total_matches} match(es) -- wrote full results to {out_path}"
-                )
-        # Restore the bank search button to reflect the currently active animation.
-        if self._active_animation and self._active_animation.get("external_bank_pointers"):
-            names = ", ".join(p.name for p in self._active_animation["external_bank_pointers"])
-            self.bank_search_button.configure(state="normal", text=f"Find {names}…")
-        else:
-            self.bank_search_button.configure(state="disabled", text="Find external bank…")
-        group_option = (self._active_animation or {}).get("group_option") or {}
-        if self._loaded_banks and group_option.get("clip") is not None:
-            self.use_real_mapping_checkbox.configure(state="normal")
-
-    def _compute_real_mapping(self):
-        """Try to compute the real bank-based channel-to-bone mapping for
-        the currently active clip, using any bank(s) already found via
-        'Find external bank...'. Returns (mapping, channels) or None."""
-        if not self._active_animation or not self._loaded_banks:
-            return None
-        group_option = self._active_animation.get("group_option")
-        if not group_option or group_option.get("clip") is None:
-            return None
-        active = self._active_character
-        if active is None:
-            return None
-        from .frostbite_rigamate import decode_rigamate_bone_mapping
-        from .frostbite_animation_channels import decode_quaternion_array_positional, find_enclosing_block_offset
-        clip = group_option["clip"]
-        raw = group_option["raw"]
-        headers = group_option["headers"]
-        skeleton = active["skeleton"]
-        for bank_raw in self._loaded_banks.values():
-            try:
-                bone_mapping = decode_rigamate_bone_mapping(bank_raw, clip, skeleton)
-            except Exception:
-                continue
-            if bone_mapping is None:
-                continue
-            quat_header = headers[2]
-            block_offset = find_enclosing_block_offset(raw, headers[0].offset)
-            positional_channels = decode_quaternion_array_positional(
-                raw, headers[0].offset, quat_header.count, quat_header.declared_value, block_offset,
-            )
-            real_channels, real_mapping = [], []
-            for channel_index, bone_index in zip(bone_mapping.channel_indices, bone_mapping.bone_indices):
-                if channel_index < len(positional_channels) and positional_channels[channel_index] is not None:
-                    real_channels.append(positional_channels[channel_index])
-                    real_mapping.append(bone_index)
-            if real_mapping:
-                return real_mapping, real_channels
-        return None
-
-    def _on_real_mapping_toggle(self) -> None:
-        if self._active_animation is None:
-            return
-        if self.use_real_mapping_var.get():
-            result = self._compute_real_mapping()
-            if result is None:
-                self.use_real_mapping_var.set(False)
-                self.status_var.set(
-                    "Could not compute a real bank mapping for this clip "
-                    "(bank found, but it doesn't resolve this specific clip's DOF IDs)."
-                )
-                return
-            mapping, channels = result
-            from .frostbite_animation_channels import analyze_quaternion_channel_health
-            # Re-apply our own corruption detection on top of the real
-            # mapping if "Skip flagged channels" is enabled -- a real
-            # mapping doesn't mean the underlying channel data is clean.
-            if self.animation_filter_unhealthy_var.get():
-                health = analyze_quaternion_channel_health(channels, mapping, self._active_character["skeleton"])
-                mapping = [m for m, h in zip(mapping, health) if h.healthy]
-                channels = [c for c, h in zip(channels, health) if h.healthy]
-            self._active_animation["channels"] = channels
-            self._active_animation["mapping"] = mapping
-            # Keep health info consistent with the mapping now in use, so
-            # "Channel health..." doesn't show stale guessed-mapping data.
-            self._active_animation["health"] = analyze_quaternion_channel_health(
-                channels, mapping, self._active_character["skeleton"],
-            )
-            self.status_var.set(f"Using real bank mapping: {len(mapping)} channels resolved by name.")
-        else:
-            self._active_animation["channels"] = self._active_animation["guessed_channels"]
-            self._active_animation["mapping"] = self._active_animation["guessed_mapping"]
-            if "guessed_health" in self._active_animation:
-                self._active_animation["health"] = self._active_animation["guessed_health"]
-            self.status_var.set("Reverted to the guessed channel-to-bone mapping.")
-        self._animation_playback = None  # stale; rebuilt on next Play
-
     def _on_animation_group_selected(self, _event=None) -> None:
         index = self.animation_group_combo.current()
         if index < 0 or index >= len(self._animation_group_options):
             return
-        option = self._animation_group_options[index]
-        active = self._active_character
-        if active is None:
+        source = getattr(self, "_animation_group_source", None)
+        if source is None:
             return
-        from .frostbite_animation_channels import analyze_quaternion_channel_health, format_channel_health_summary
-        from .frostbite_animation_playback import guess_bone_mapping
-        real_q = option["channels"]
-        mapping = guess_bone_mapping(active["skeleton"], len(real_q), active.get("primary_rig_order"))
-        health = analyze_quaternion_channel_health(real_q, mapping, active["skeleton"])
-        name = self._active_animation["name"] if self._active_animation else "animation"
-        external_bank_pointers = (
-            self._active_animation.get("external_bank_pointers", []) if self._active_animation else []
+        if self._animation_start_time is not None:
+            self._stop_active_animation()
+        asset, title, original_info = source
+        selected_info = dict(original_info)
+        selected_info["_animation_group_default_index"] = index
+        self._show_frostbite_animation_record(asset, title, selected_info)
+
+    def _step_animation_group(self, direction: int) -> None:
+        index = self.animation_group_combo.current() + direction
+        if not 0 <= index < len(self._animation_group_options):
+            return
+        self.animation_group_combo.current(index)
+        self._on_animation_group_selected()
+
+    def _matching_clip_indices(self) -> list[int]:
+        terms = self.animation_clip_filter_var.get().casefold().split()
+        if not terms:
+            return []
+        return [
+            index for index, option in enumerate(self._animation_group_options)
+            if all(term in str(option["clip"].name).casefold() for term in terms)
+        ]
+
+    def _update_clip_search_matches(self, _event=None) -> None:
+        self._animation_clip_search_cursor = None
+        matches = self._matching_clip_indices()
+        enabled = "normal" if matches else "disabled"
+        self.animation_clip_match_previous_button.configure(state=enabled)
+        self.animation_clip_match_next_button.configure(state=enabled)
+        if not self.animation_clip_filter_var.get().strip():
+            self.animation_clip_match_var.set("")
+        elif matches:
+            self.animation_clip_match_var.set(f"{len(matches)} match(es)")
+        else:
+            self.animation_clip_match_var.set("No matches")
+
+    def _step_clip_search(self, direction: int) -> str:
+        matches = self._matching_clip_indices()
+        if not matches:
+            self._update_clip_search_matches()
+            return "break"
+        current = self.animation_group_combo.current()
+        if self._animation_clip_search_cursor not in matches:
+            if direction > 0:
+                candidates = [index for index in matches if index > current]
+                selected = candidates[0] if candidates else matches[0]
+            else:
+                candidates = [index for index in matches if index < current]
+                selected = candidates[-1] if candidates else matches[-1]
+        else:
+            position = matches.index(self._animation_clip_search_cursor)
+            selected = matches[(position + direction) % len(matches)]
+        self._animation_clip_search_cursor = selected
+        self.animation_group_combo.current(selected)
+        self.animation_clip_match_var.set(
+            f"{matches.index(selected) + 1} / {len(matches)} matches"
         )
-        self._active_animation = {
-            "channels": real_q,
-            "mapping": mapping,
-            "guessed_channels": real_q,
-            "guessed_mapping": mapping,
-            "guessed_health": health,
-            "name": name,
-            "health": health,
-            "external_bank_pointers": external_bank_pointers,
-            "group_option": option,
-        }
-        self.use_real_mapping_var.set(False)
-        self._animation_playback = None  # stale mapping from the previous group; rebuilt on next Play
-        self.animation_dump_button.configure(state="normal")
-        self.animation_health_button.configure(state="normal")
-        summary = format_channel_health_summary(health)
-        self.animation_state_var.set(
-            f"{len(real_q)} rotation channels available ({summary}) -- bone mapping is a best guess."
-        )
-        self.status_var.set(f"Switched to {option['label']}. Press Play to preview.")
+        self._on_animation_group_selected()
+        return "break"
 
     def _play_active_animation(self) -> None:
         animation = self._active_animation
@@ -587,24 +685,72 @@ class App(tk.Tk):
             return
         mapping, channels = animation["mapping"], animation["channels"]
         filtering_note = ""
+        transition_delta = False
+        if self._prototype_running:
+            from .interceptor_prototype import transition_base_clip_name
+            transition_delta = transition_base_clip_name(
+                str(animation.get("name", "")),
+            ) is not None
+            if transition_delta:
+                bases = animation.get("transition_base_rotations") or []
+                if len(bases) == len(channels):
+                    from .frostbite_animation_playback import compose_transition_loop_channels
+                    channels = compose_transition_loop_channels(channels, bases)
+                else:
+                    transition_delta = False
         if self.animation_filter_unhealthy_var.get() and animation.get("health"):
             from .frostbite_animation_playback import filter_healthy_channels
             mapping, channels = filter_healthy_channels(mapping, channels, animation["health"])
             skipped = len(animation["mapping"]) - len(mapping)
             if skipped:
                 filtering_note = f" ({skipped} flagged channel(s) skipped)"
+        vector_mapping = list(animation.get("vector_mapping", []))
+        vector_channels = list(animation.get("vector_channels", []))
+        if self._prototype_running:
+            # World/controller motion is applied by the prototype physics.
+            # Keep actual deforming-joint translations (Hips, props, etc.) but
+            # do not move the centred render mesh through trajectory/camera
+            # helper joints a second time.
+            from .viewer import animation_helper_visible
+            pairs = [
+                (bone_index, channel)
+                for bone_index, channel in zip(vector_mapping, vector_channels)
+                if 0 <= bone_index < len(character["skeleton"].joints)
+                and animation_helper_visible(character["skeleton"].joints[bone_index][0])
+            ]
+            vector_mapping = [pair[0] for pair in pairs]
+            vector_channels = [pair[1] for pair in pairs]
+        self._animation_generation += 1
+        self._animation_skin_running = False
         self._animation_playback = {
             "skeleton": character["skeleton"],
             "bind_rotations": character.get("bind_rotations") or [],
             "mapping": mapping,
             "channels": channels,
-            "loop_seconds": 3.0,
+            "vector_mapping": vector_mapping,
+            "vector_channels": vector_channels,
+            "rotation_mode": "absolute",
+            "timeline_end": animation.get("timeline_end"),
+            "loop_seconds": max(
+                0.1,
+                float(animation.get("timeline_end") or 1)
+                / (float(animation.get("fps") or 30.0)
+                   * float(animation.get("time_scale") or 1.0)),
+            ),
         }
+        from .frostbite_animation_playback import evaluate_pose_transforms
+        self._animation_playback["bind_world"] = evaluate_pose_transforms(
+            character["skeleton"], character.get("bind_rotations") or [], [], [], 0.0,
+        )[1]
         self._animation_start_time = self._clock()
+        self.animation_speed_var.set(f"{float(animation.get('time_scale') or 1.0):g}×")
         self.animation_play_button.configure(state="disabled")
         self.animation_stop_button.configure(state="normal")
         self.status_var.set(
-            f"Playing {animation['name']}{filtering_note} · bone mapping is a best guess, watch for obviously wrong bones."
+            f"Playing {animation['name']}{filtering_note} · "
+            f"{animation.get('mapping_kind', 'named DOF')} mapping; "
+            + ("transition endpoint plus normalized loop motion."
+               if transition_delta else "absolute local rotations.")
         )
         self._animation_tick()
 
@@ -613,9 +759,12 @@ class App(tk.Tk):
             self.after_cancel(self._animation_after_id)
             self._animation_after_id = None
         self._animation_start_time = None
+        self._animation_generation += 1
+        self._animation_skin_running = False
         self.animation_play_button.configure(state="normal" if self._active_animation else "disabled")
         self.animation_stop_button.configure(state="disabled")
-        self._show_active_character()
+        if not self._prototype_running:
+            self._show_active_character()
 
     @staticmethod
     def _clock() -> float:
@@ -626,7 +775,8 @@ class App(tk.Tk):
         playback = getattr(self, "_animation_playback", None)
         if playback is None or self._animation_start_time is None:
             return
-        from .frostbite_animation_playback import evaluate_pose
+        from .frostbite_animation_playback import evaluate_pose_transforms
+        from .frostbite_skinning import skin_meshes
         elapsed = self._clock() - self._animation_start_time
         loop_seconds = playback["loop_seconds"]
         if not self.animation_loop_var.get() and elapsed >= loop_seconds:
@@ -634,9 +784,510 @@ class App(tk.Tk):
             return
         phase = (elapsed % loop_seconds) / loop_seconds
         self._last_animation_phase = phase
-        pose = evaluate_pose(playback["skeleton"], playback["bind_rotations"], playback["mapping"], playback["channels"], phase)
-        self.viewer.set_mesh_skeleton(pose)
-        self._animation_after_id = self.after(33, self._animation_tick)
+        pose, world = evaluate_pose_transforms(
+            playback["skeleton"], playback["bind_rotations"],
+            playback["mapping"], playback["channels"], phase,
+            rotation_mode=playback.get("rotation_mode", "absolute"),
+            vector_mapping=playback.get("vector_mapping"),
+            vector_channels=playback.get("vector_channels"),
+            timeline_end=playback.get("timeline_end"),
+        )
+        if self.viewer.mesh_visible.get():
+            if not self._animation_skin_running:
+                self._animation_skin_running = True
+                generation = self._animation_generation
+                source_meshes = self._active_character["meshes"]
+
+                def skin_worker() -> None:
+                    try:
+                        skinned = skin_meshes(
+                            source_meshes, playback["skeleton"], pose,
+                            playback["bind_world"], world,
+                        )
+                        self.after(
+                            0, self._finish_animation_skin,
+                            generation, skinned, pose, None,
+                        )
+                    except Exception as error:
+                        self.after(
+                            0, self._finish_animation_skin,
+                            generation, None, pose, str(error),
+                        )
+
+                threading.Thread(target=skin_worker, daemon=True).start()
+        else:
+            self.viewer.set_mesh_pose(None, pose, realtime=False)
+        if self._prototype_running:
+            lod = int((self._active_character or {}).get("lod", 5))
+            delay = {0: 300, 1: 240, 2: 180, 3: 140, 4: 110, 5: 83}.get(lod, 140)
+        else:
+            delay = 33
+        self._animation_after_id = self.after(delay, self._animation_tick)
+
+    def _finish_animation_skin(
+        self, generation: int, skinned, pose, error: str | None,
+    ) -> None:
+        if generation != self._animation_generation:
+            return
+        self._animation_skin_running = False
+        if error is not None:
+            self.status_var.set(f"Animation skinning paused safely: {error}")
+            return
+        if self._animation_start_time is not None:
+            # Bitmap rasterization is also asynchronous and coalesces obsolete
+            # requests, keeping Tk's input/event loop responsive.
+            self.viewer.set_mesh_pose(skinned, pose, realtime=False)
+
+    def _update_prototype_button(self) -> None:
+        if not hasattr(self, "prototype_button"):
+            return
+        ready = (
+            self._active_character is not None
+            and self._active_character.get("family") == "exf"
+            and bool(self._animation_group_options)
+        )
+        self.prototype_button.configure(
+            state="normal" if ready or self._prototype_running else "disabled",
+            text="Stop prototype" if self._prototype_running else "Play prototype",
+        )
+        if hasattr(self, "prototype_export_button"):
+            self.prototype_export_button.configure(
+                state="normal" if ready and not self._standalone_export_running else "disabled",
+            )
+
+    def _collect_standalone_animations(self) -> dict[str, dict[str, object]]:
+        """Bake the controller's state clips through the verified live mapper."""
+        source = getattr(self, "_animation_group_source", None)
+        if source is None:
+            raise ValueError("Preview the Interceptor animation bank first.")
+        from .frostbite_animation_playback import (
+            compose_transition_loop_channels, filter_healthy_channels,
+        )
+        from .interceptor_prototype import select_clip_index, transition_base_clip_name
+
+        asset, title, original_info = source
+        names = [option["clip"].name for option in self._animation_group_options]
+        baked: dict[str, dict[str, object]] = {}
+        previous_running = self._prototype_running
+        self._prototype_running = True  # Enables authored transition anchoring.
+        try:
+            for state in ("idle", "walk", "sprint", "jump", "fall", "land", "hover", "flight", "glide", "dash"):
+                index = select_clip_index(names, state)
+                if index is None:
+                    continue
+                selected_info = dict(original_info)
+                selected_info["_animation_group_default_index"] = index
+                self._show_frostbite_animation_record(asset, title, selected_info)
+                if self._active_animation is None:
+                    continue
+                animation = dict(self._active_animation)
+                channels = list(animation["channels"])
+                mapping = list(animation["mapping"])
+                if transition_base_clip_name(str(animation.get("name", ""))) is not None:
+                    bases = animation.get("transition_base_rotations") or []
+                    if len(bases) == len(channels):
+                        channels = compose_transition_loop_channels(channels, bases)
+                if animation.get("health"):
+                    mapping, channels = filter_healthy_channels(
+                        mapping, channels, animation["health"],
+                    )
+                animation["mapping"] = mapping
+                animation["channels"] = channels
+                animation["transition_base_rotations"] = []
+                animation["health"] = None
+                baked[state] = animation
+        finally:
+            self._prototype_running = previous_running
+            self._update_prototype_button()
+        if "idle" not in baked:
+            raise ValueError("The decoded bank did not produce the required Interceptor idle clip.")
+        return baked
+
+    def _export_standalone_prototype(self) -> None:
+        character = self._active_character
+        if character is None or character.get("family") != "exf":
+            messagebox.showinfo(
+                "Interceptor required",
+                "Preview the Interceptor base mesh and enable Use for animation first.",
+            )
+            return
+        destination_parent = filedialog.askdirectory(
+            title="Choose where to create the standalone Interceptor prototype",
+        )
+        if not destination_parent:
+            return
+        if self._prototype_running:
+            self._stop_interceptor_prototype()
+        try:
+            animations = self._collect_standalone_animations()
+        except Exception as error:
+            messagebox.showerror("Cannot bake prototype animations", str(error))
+            return
+        import time
+        destination = Path(destination_parent) / "Interceptor-Standalone-0.28.12"
+        if destination.exists():
+            destination = destination.with_name(
+                destination.name + "-" + time.strftime("%Y%m%d-%H%M%S"),
+            )
+        self._standalone_export_running = True
+        self._update_prototype_button()
+        self.status_var.set(
+            "Baking the decoded Interceptor LODs once for the standalone runtime…",
+        )
+        root = self.result.engine_root or self.result.root if self.result else None
+        threading.Thread(
+            target=self._standalone_export_worker,
+            args=(destination, root, dict(character), animations), daemon=True,
+        ).start()
+
+    def _standalone_export_worker(
+        self, destination: Path, root: Path | None, character: dict[str, object],
+        animations: dict[str, dict[str, object]],
+    ) -> None:
+        try:
+            if root is None:
+                raise ValueError("The scanned Anthem installation is no longer available for the one-time bake.")
+            from .frostbite import preview_frostbite_meshset_isolated
+            from .standalone_export import export_standalone_folder
+
+            lod_meshes: dict[int, object] = {}
+            available = sorted({int(value) for value in character.get("available_lods", [])})
+            for lod in available:
+                self.after(0, self.status_var.set, f"Baking standalone LOD{lod}…")
+                preview = preview_frostbite_meshset_isolated(
+                    root, character["asset"], lod_index=lod,
+                )
+                if preview[0] != "unavailable":
+                    lod_meshes[int(preview[2])] = preview[1]
+            current_lod = int(character.get("lod", -1))
+            if current_lod >= 0 and current_lod not in lod_meshes:
+                lod_meshes[current_lod] = character["meshes"]
+            if not lod_meshes:
+                raise ValueError("No Interceptor geometry could be baked into the standalone package.")
+            payload = {
+                "name": character.get("name", "Interceptor"),
+                "lod_meshes": lod_meshes,
+                "skeleton": character["skeleton"],
+                "bind_rotations": character.get("bind_rotations") or [],
+                "animations": animations,
+            }
+            export_standalone_folder(
+                destination, payload, Path(__file__).resolve().parent,
+            )
+            self.after(0, self._finish_standalone_export, destination, None)
+        except Exception as error:
+            self.after(0, self._finish_standalone_export, destination, str(error))
+
+    def _finish_standalone_export(self, destination: Path, error: str | None) -> None:
+        self._standalone_export_running = False
+        self._update_prototype_button()
+        if error is not None:
+            self.status_var.set(f"Standalone export failed safely: {error}")
+            messagebox.showerror("Cannot export standalone prototype", error)
+            return
+        launcher = destination / "Play Interceptor Prototype.bat"
+        self.status_var.set(f"Standalone Interceptor prototype exported to {destination}.")
+        messagebox.showinfo(
+            "Standalone prototype ready",
+            f"Created:\n{destination}\n\n"
+            f"Double-click {launcher.name} to play. It starts at LOD5 and no longer "
+            "scans, decrypts, or reads the Anthem installation.",
+        )
+
+    def _toggle_interceptor_prototype(self) -> None:
+        if self._prototype_running:
+            self._stop_interceptor_prototype()
+        else:
+            self._start_interceptor_prototype()
+
+    def _start_interceptor_prototype(self) -> None:
+        character = self._active_character
+        if character is None or character.get("family") != "exf":
+            messagebox.showinfo(
+                "Interceptor required",
+                "Preview the Interceptor base mesh and enable Use for animation first.",
+            )
+            return
+        if not self._animation_group_options:
+            messagebox.showinfo(
+                "Animation bank required",
+                "Preview the 584-clip Interceptor AntState RES first, then click Play prototype.",
+            )
+            return
+        from .interceptor_prototype import InterceptorController
+        self._stop_active_animation()
+        self._prototype_running = True
+        self._prototype_controller = InterceptorController()
+        self._prototype_held.clear()
+        self._prototype_pressed.clear()
+        self._prototype_animation_cache.clear()
+        self._prototype_clip_index = None
+        self._prototype_last_time = self._clock()
+        self._prototype_global_lod = 5
+        self.viewer.bones_visible.set(False)
+        self.viewer.zoom = max(self.viewer.zoom, 1.35)
+        self.animation_loop_var.set(True)
+        self._update_prototype_button()
+        # LOD5 is intentionally requested before any higher-detail geometry.
+        # If the active preview is already LOD5 this is a no-op.
+        self._set_prototype_lod(5)
+        self._select_prototype_animation("idle")
+        self.status_var.set(
+            "Interceptor prototype running at global LOD5. Click the viewport, then use "
+            "WASD, Shift, Space, F, Ctrl and Q; numpad 0–5 changes global detail."
+        )
+        self.viewer.canvas.focus_set()
+        self._prototype_tick()
+
+    def _stop_interceptor_prototype(self) -> None:
+        if self._prototype_after_id is not None:
+            self.after_cancel(self._prototype_after_id)
+            self._prototype_after_id = None
+        self._prototype_running = False
+        self._prototype_controller = None
+        self._prototype_held.clear()
+        self._prototype_pressed.clear()
+        self.viewer.set_prototype_overlay(None)
+        self._stop_active_animation()
+        self._update_prototype_button()
+        self.status_var.set("Interceptor prototype stopped; the active character remains loaded.")
+
+    @staticmethod
+    def _prototype_key_name(event) -> str | None:
+        folded = str(getattr(event, "keysym", "")).casefold()
+        aliases = {
+            "shift_l": "shift", "shift_r": "shift",
+            "control_l": "control", "control_r": "control",
+        }
+        return aliases.get(folded, folded if folded in {
+            "w", "a", "s", "d", "shift", "control", "space", "f", "q", "escape",
+        } else None)
+
+    @staticmethod
+    def _prototype_numpad_lod(event) -> int | None:
+        folded = str(getattr(event, "keysym", "")).casefold()
+        direct = {f"kp_{value}": value for value in range(6)}
+        direct.update({
+            "kp_insert": 0, "kp_end": 1, "kp_down": 2,
+            "kp_next": 3, "kp_left": 4, "kp_begin": 5,
+        })
+        if folded in direct:
+            return direct[folded]
+        keycode = int(getattr(event, "keycode", -1))
+        if 96 <= keycode <= 101:
+            return keycode - 96
+        return int(folded) if folded in {"0", "1", "2", "3", "4", "5"} else None
+
+    def _prototype_key_press(self, event):
+        if not self._prototype_running:
+            return None
+        if isinstance(getattr(event, "widget", None), (tk.Entry, ttk.Entry, ttk.Combobox)):
+            return None
+        lod = self._prototype_numpad_lod(event)
+        if lod is not None:
+            self._set_prototype_lod(lod)
+            return "break"
+        key = self._prototype_key_name(event)
+        if key is None:
+            return None
+        if key == "escape":
+            self._stop_interceptor_prototype()
+            return "break"
+        if key not in self._prototype_held:
+            self._prototype_pressed.add(key)
+        self._prototype_held.add(key)
+        return "break"
+
+    def _prototype_key_release(self, event):
+        if not self._prototype_running:
+            return None
+        if isinstance(getattr(event, "widget", None), (tk.Entry, ttk.Entry, ttk.Combobox)):
+            return None
+        key = self._prototype_key_name(event)
+        if key is not None:
+            self._prototype_held.discard(key)
+            return "break"
+        return None
+
+    def _set_prototype_lod(self, lod: int) -> None:
+        character = self._active_character
+        if character is None:
+            return
+        available = [int(value) for value in character.get("available_lods", [])]
+        if lod not in available:
+            self.status_var.set(
+                f"Global LOD{lod} was requested, but this Interceptor MeshSet stores only "
+                + ", ".join(f"LOD{value}" for value in sorted(available)) + "."
+            )
+            return
+        self._prototype_global_lod = lod
+        if int(character.get("lod", -1)) != lod:
+            self._request_frostbite_lod(character["asset"], lod)
+
+    def _select_prototype_animation(self, state: str) -> None:
+        from .interceptor_prototype import select_clip_index
+        names = [option["clip"].name for option in self._animation_group_options]
+        index = select_clip_index(names, state)
+        if index is None or index == self._prototype_clip_index:
+            return
+        self._prototype_clip_index = index
+        if index in self._prototype_animation_cache:
+            self._stop_active_animation()
+            self._active_animation = dict(self._prototype_animation_cache[index])
+            self.animation_group_combo.current(index)
+            self.animation_clip_position_var.set(f"{index + 1} / {len(names)}")
+            self.animation_clip_var.set(f"Animation: {self._active_animation['name']} · prototype")
+            self._play_active_animation()
+            return
+        source = getattr(self, "_animation_group_source", None)
+        if source is None:
+            return
+        asset, title, original_info = source
+        selected_info = dict(original_info)
+        selected_info["_animation_group_default_index"] = index
+        self._show_frostbite_animation_record(asset, title, selected_info)
+        if self._active_animation is not None:
+            self._prototype_animation_cache[index] = dict(self._active_animation)
+            self._play_active_animation()
+
+    def _prototype_tick(self) -> None:
+        if not self._prototype_running or self._prototype_controller is None:
+            return
+        from .interceptor_prototype import PrototypeInput
+        now = self._clock()
+        elapsed = now - (self._prototype_last_time or now)
+        self._prototype_last_time = now
+        held, pressed = self._prototype_held, self._prototype_pressed
+        controls = PrototypeInput(
+            forward=float("w" in held) - float("s" in held),
+            right=float("d" in held) - float("a" in held),
+            sprint="shift" in held,
+            jump_pressed="space" in pressed,
+            flight_toggled="f" in pressed,
+            ascend="space" in held,
+            descend="control" in held,
+            dash_pressed="q" in pressed,
+        )
+        self._prototype_pressed.clear()
+        state = self._prototype_controller.update(elapsed, controls, -self.viewer.yaw)
+        animation_state = "glide" if state.mode == "flight" and controls.sprint else state.mode
+        self._select_prototype_animation(animation_state)
+        speed = (state.vx * state.vx + state.vy * state.vy + state.vz * state.vz) ** 0.5
+        clip = str((self._active_animation or {}).get("name", "finding animation…"))
+        self.viewer.set_prototype_overlay({
+            "x": state.x, "y": state.y, "z": state.z,
+            "speed": speed, "state": state.mode,
+            "lod": self._prototype_global_lod, "clip": clip,
+        }, redraw=self._animation_start_time is None)
+        self._prototype_after_id = self.after(16, self._prototype_tick)
+
+    def _save_animation_video(self) -> None:
+        """Render a clip frame-by-frame, then store a dependency-free MJPEG AVI."""
+        animation = self._active_animation
+        character = self._active_character
+        if animation is None or character is None or self._video_export_running:
+            return
+        destination = filedialog.asksaveasfilename(
+            title="Save animation video", defaultextension=".avi",
+            filetypes=(("Motion JPEG video", "*.avi"),),
+            initialfile=re.sub(r"[^A-Za-z0-9._-]+", "_", animation["name"]).strip("_") + ".avi",
+        )
+        if not destination:
+            return
+        self._stop_active_animation()
+        mapping, channels = animation["mapping"], animation["channels"]
+        if self.animation_filter_unhealthy_var.get() and animation.get("health"):
+            from .frostbite_animation_playback import filter_healthy_channels
+            mapping, channels = filter_healthy_channels(mapping, channels, animation["health"])
+        fps = 15
+        loop_seconds = max(
+            0.1, float(animation.get("timeline_end") or 1)
+            / (float(animation.get("fps") or 30.0)
+               * float(animation.get("time_scale") or 1.0)),
+        )
+        frame_count = max(2, round(loop_seconds * fps))
+        # A fixed, shareable resolution keeps an LOD0 export bounded even when
+        # the on-screen viewport is very large. Rendering is deliberately
+        # offline: every frame completes before the next one is encoded.
+        width, height = 960, 720
+        center, extent = self.viewer._mesh_center, self.viewer._mesh_extent
+        yaw, pitch, zoom = self.viewer.yaw, self.viewer.pitch, self.viewer.zoom
+        wireframe = bool(self.viewer.wireframe.get())
+        skeleton = character["skeleton"]
+        bind_rotations = character.get("bind_rotations") or []
+        source_meshes = character["meshes"]
+        vector_mapping = animation.get("vector_mapping", [])
+        vector_channels = animation.get("vector_channels", [])
+        timeline_end = animation.get("timeline_end")
+        self._video_export_running = True
+        self.animation_video_button.configure(state="disabled")
+        self.animation_play_button.configure(state="disabled")
+        self.status_var.set(
+            f"Offline-rendering {frame_count} frames at {width}×{height}; the app stays usable."
+        )
+
+        def worker() -> None:
+            try:
+                from .frostbite_animation_playback import evaluate_pose_transforms
+                from .frostbite_skinning import skin_meshes
+                from .geometry import MeshData
+                from .video_export import write_mjpeg_avi
+                from .viewer import render_mesh_raster
+                bind_world = evaluate_pose_transforms(
+                    skeleton, bind_rotations, [], [], 0.0,
+                )[1]
+
+                def frames():
+                    for frame_index in range(frame_count):
+                        phase = frame_index / frame_count
+                        pose, world = evaluate_pose_transforms(
+                            skeleton, bind_rotations, mapping, channels, phase,
+                            rotation_mode="absolute", vector_mapping=vector_mapping,
+                            vector_channels=vector_channels, timeline_end=timeline_end,
+                        )
+                        skinned = skin_meshes(
+                            source_meshes, skeleton, pose, bind_world, world,
+                        )
+                        normalized = [MeshData(
+                            mesh.name,
+                            [tuple((vertex[i] - center[i]) / extent for i in range(3))
+                             for vertex in mesh.vertices],
+                            mesh.faces, mesh.skin_bones, mesh.skin_weights,
+                        ) for mesh in skinned]
+                        if frame_index % 5 == 0:
+                            self.after(
+                                0, self.status_var.set,
+                                f"Offline-rendering frame {frame_index + 1:,} / {frame_count:,}…",
+                            )
+                        yield render_mesh_raster(
+                            normalized, width, height, yaw, pitch, zoom, wireframe,
+                        )
+
+                written = write_mjpeg_avi(
+                    Path(destination), frames(), width=width, height=height, fps=fps,
+                )
+                self.after(0, self._finish_animation_video, destination, written, None)
+            except Exception as error:
+                self.after(0, self._finish_animation_video, destination, 0, str(error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_animation_video(
+        self, destination: str, frame_count: int, error: str | None,
+    ) -> None:
+        self._video_export_running = False
+        enabled = "normal" if self._active_animation is not None else "disabled"
+        self.animation_video_button.configure(state=enabled)
+        self.animation_play_button.configure(state=enabled)
+        if error:
+            self.status_var.set(f"Animation video export failed: {error}")
+            messagebox.showerror("Cannot save animation video", error)
+            return
+        self.status_var.set(f"Saved {frame_count:,}-frame animation video to {destination}")
+        messagebox.showinfo(
+            "Animation video saved",
+            f"Saved an offline-rendered {frame_count:,}-frame Motion JPEG video to:\n{destination}",
+        )
 
     def _dump_animation_pose_debug(self) -> None:
         animation = self._active_animation
@@ -657,13 +1308,22 @@ class App(tk.Tk):
         records = describe_pose_debug(
             character["skeleton"], character.get("bind_rotations") or [],
             mapping, channels, phase,
+            rotation_mode=(playback.get("rotation_mode", "absolute")
+                           if playback else "absolute"),
+            vector_mapping=(playback.get("vector_mapping") if playback
+                            else animation.get("vector_mapping")),
+            vector_channels=(playback.get("vector_channels") if playback
+                             else animation.get("vector_channels")),
+            timeline_end=(playback.get("timeline_end") if playback
+                          else animation.get("timeline_end")),
         )
         text = format_pose_debug(records, phase)
         text = (
             f"Character: {character.get('name', '?')}\n"
             f"Animation: {animation.get('name', '?')}\n"
             f"Total joints: {len(character['skeleton'].joints)}, "
-            f"channels available: {len(channels)}"
+            f"rotation channels available: {len(channels)}, "
+            f"translation channels applied: {len(animation.get('vector_channels', []))}"
             f"{' (filtered to healthy only)' if playback and len(channels) < len(animation['channels']) else ''}\n\n"
         ) + text
         try:
@@ -746,8 +1406,12 @@ class App(tk.Tk):
         self._unity_indexed_categories.clear()
         self._frostbite_inventory_started = False
         self._frostbite_skeleton_cache.clear()
+        self._frostbite_virtual_asset_cache.clear()
         self._preview_character = None
         self._active_character = None
+        self._resolved_rigamate_asset = None
+        self._resolved_rigamate_raw = None
+        self.rigamate_extract_button.configure(state="disabled")
         self.use_for_animation_var.set(False)
         self.use_for_animation_check.configure(state="disabled")
         self.active_character_var.set("No active character")
@@ -784,26 +1448,14 @@ class App(tk.Tk):
         expanded = self._expanded_folders.setdefault(category, set())
         focused_folder = self._folder_focus.get(category)
         search_terms = tuple(
-            term for term in self.search_var.get().lower().split() if term
+            term for term in self.search_var.get().casefold().split() if term
         )
         exclude_terms = tuple(
-            term for term in self.exclude_search_var.get().lower().split() if term
+            term for term in self.exclude_search_var.get().casefold().split() if term
         )
 
         def search_matches(asset) -> bool:
-            if not search_terms and not exclude_terms:
-                return True
-            haystack = " ".join((
-                asset.relative_path,
-                asset.internal_path or "",
-                str(asset.metadata.get("bundle_name", "")),
-            )).lower()
-            return (all(term in haystack for term in search_terms)
-                    and not any(term in haystack for term in exclude_terms))
-
-        def animation_res_visible(asset) -> bool:
-            return (category != "Animations" or not self.animation_res_only_var.get()
-                    or asset.extension.casefold() == ".res")
+            return self._asset_matches_search(asset, search_terms, exclude_terms)
 
         def in_virtual_scope(asset) -> bool:
             if self._virtual_scope is None:
@@ -835,6 +1487,9 @@ class App(tk.Tk):
                 lambda bundle: search_matches(bundle.mesh), expanded,
             )
         else:
+            if (category == "Animations" and self.animation_clip_search_var.get()
+                    and (search_terms or exclude_terms) and self.result):
+                self._start_animation_clip_index(result.assets)
             self.tree.heading("mesh", text="Asset / archive")
             # Non-character categories are an inventory view, so they include
             # low-confidence files by design; the character checkbox remains
@@ -843,7 +1498,7 @@ class App(tk.Tk):
                 asset for asset in result.assets
                 if (category == "All" or category_for_asset(asset) == category)
                 and in_virtual_scope(asset)
-                and animation_res_visible(asset)
+                and self._animation_res_visible(category, self.animation_res_only_var.get(), asset)
             ]
             # Show decoded/internal assets before their parent archive. Clicking
             # an .img row means "probe this container"; clicking its child WDR,
@@ -907,7 +1562,7 @@ class App(tk.Tk):
                 preview_state = "unsupported"
             self.tree.insert("", "end", iid=f"bundle-{index}", values=(
                 f"{bundle.score:.1f}", bundle.mesh.relative_path,
-                "yes" if bundle.count("skeleton") else "—", bundle.count("animation"),
+                "yes" if bundle.count("skeleton") else "—", self._animation_display_count(bundle),
                 bundle.count("texture"), preview_state,
             ))
         selected_row = None
@@ -1239,47 +1894,18 @@ class App(tk.Tk):
         if not bundle:
             messagebox.showinfo("Nothing selected", "Scan and select a candidate first.")
             return
-        category = self.category_var.get()
-        if self._preview_running:
-            # Rapid double-clicks across different rows previously had no
-            # protection at all: each one spawned its own background thread
-            # AND its own subprocess, with nothing stopping them from piling
-            # up concurrently. Enough of those running at once can starve
-            # the whole system for CPU/memory, which can make Windows report
-            # the main window as "Not Responding" even though it isn't
-            # technically deadlocked. Queue the latest request instead of
-            # starting another one on top of the current one.
-            self._pending_preview = (bundle, category)
-            self.status_var.set(f"Finishing the current preview before starting {bundle.name}…")
-            return
         self.viewer.clear_detail_levels()
+        self._assembly_source = None
+        self.assemble_button.configure(state="disabled")
         self._rig_report = None
         self._rig_asset = None
         self.rig_button.configure(state="disabled")
         self.preview_button.configure(state="disabled")
         self.status_var.set(f"Preparing embedded preview for {bundle.name}…")
-        self._preview_running = True
         # Tk variables must only be read on the Tk thread. Capture the current
         # filter before starting the decoder worker.
-        threading.Thread(target=self._run_preview_worker, args=(bundle, category), daemon=True).start()
-
-    def _run_preview_worker(self, bundle, category: str) -> None:
-        try:
-            self._preview_worker(bundle, category)
-        finally:
-            # Guaranteed to run even if _preview_worker raises, so the guard
-            # above can never get stuck "running" forever.
-            self.after(0, self._preview_worker_finished)
-
-    def _preview_worker_finished(self) -> None:
-        self._preview_running = False
-        if self._pending_preview is not None:
-            bundle, category = self._pending_preview
-            self._pending_preview = None
-            self.preview_button.configure(state="disabled")
-            self.status_var.set(f"Preparing embedded preview for {bundle.name}…")
-            self._preview_running = True
-            threading.Thread(target=self._run_preview_worker, args=(bundle, category), daemon=True).start()
+        category = self.category_var.get()
+        threading.Thread(target=self._preview_worker, args=(bundle, category), daemon=True).start()
 
     def _preview_worker(self, bundle, category: str) -> None:
         try:
@@ -1329,63 +1955,123 @@ class App(tk.Tk):
                 elif asset.metadata.get("record_kind") == "res":
                     from .frostbite_state import is_antstate_resource
                     if is_antstate_resource(raw):
-                        from .frostbite_animation_channels import analyze_channel_group, find_channel_array_headers
-                        from .frostbite_animation_playback import guess_bone_mapping
-                        groups = find_channel_array_headers(raw)
-                        # Real, human-readable clip names when available (verified
-                        # separately against real Anthem data -- see
-                        # frostbite_animation.py's own docstring). This is ONLY
-                        # used for display labels; the actual channel data,
-                        # rotation decoding, and playback below are entirely our
-                        # own validated pipeline, unrelated to this module.
-                        real_clips_by_qcount: dict[int, list] = {}
-                        try:
-                            from .frostbite_animation import decode_anthem_animation_stream, decode_bank_pointers
-                            for clip in decode_anthem_animation_stream(raw):
-                                real_clips_by_qcount.setdefault(
-                                    len(clip.quaternion_channels), [],
-                                ).append(clip)
-                            info["_external_bank_pointers"] = [
-                                p for p in decode_bank_pointers(raw) if p.external
-                            ]
-                        except Exception:
-                            pass  # Best-effort labeling only; falls back to "Group N" below.
-                        group_options = []
-                        for group_index, headers in enumerate(groups):
-                            report = analyze_channel_group(raw, headers)
-                            real_q = [c for c in report.quaternion_channels if not c.is_degenerate]
-                            if not real_q:
-                                continue
-                            reference = real_q[0]
-                            time_span = max(reference.times) - min(reference.times) if reference.times else 0
-                            clip_candidates = real_clips_by_qcount.get(headers[2].count, [])
-                            matching_clip = clip_candidates[0] if len(clip_candidates) == 1 else None
-                            if matching_clip is not None:
-                                label = f"{matching_clip.name} ({len(real_q)} ch, span {time_span})"
-                            else:
-                                label = f"Group {group_index} ({len(real_q)} ch, span {time_span})"
-                            group_options.append({
-                                "index": group_index, "report": report, "channels": real_q,
-                                "label": label, "raw": raw, "headers": headers, "clip": matching_clip,
+                        from .frostbite_animation import (
+                            decode_anthem_animation_stream, decode_bank_pointers,
+                            decode_primary_rig_keys,
+                        )
+                        clips = decode_anthem_animation_stream(raw)
+                        rig_keys = decode_primary_rig_keys(raw)
+                        if len(rig_keys) == 1:
+                            info["_primary_rig_key"] = rig_keys[0]
+                        bank_pointers = decode_bank_pointers(raw)
+                        clip_options = []
+                        for clip_index, clip in enumerate(clips):
+                            moving_rotations = sum(
+                                len(channel.values) > 1
+                                for channel in clip.quaternion_channels
+                            )
+                            constant_rotations = (
+                                len(clip.quaternion_channels) - moving_rotations
+                            )
+                            clip_options.append({
+                                "index": clip_index,
+                                "clip": clip,
+                                "label": (
+                                    f"{clip.name} ({clip.frame_count} frames, "
+                                    f"{moving_rotations} moving + "
+                                    f"{constant_rotations} constant rotations)"
+                                ),
                             })
-                        if group_options:
-                            # Default to the group with the most channels, same as before.
-                            best = max(group_options, key=lambda option: len(option["channels"]))
-                            info["_animation_group_options"] = group_options
-                            info["_animation_group_default_index"] = group_options.index(best)
-                            real_q = best["channels"]
-                            info["quaternion_channel_count"] = len(real_q)
-                            active = self._active_character
-                            if active is not None and real_q:
-                                mapping = guess_bone_mapping(
-                                    active["skeleton"], len(real_q), active.get("primary_rig_order"),
+                        if clip_options:
+                            info["_animation_group_options"] = clip_options
+                            info["_animation_group_default_index"] = 0
+                            info["decoded_clip_count"] = len(clips)
+                            info["quaternion_channel_count"] = len(clips[0].quaternion_channels)
+                            info["animation_channel_count"] = clips[0].channel_count
+                            info["animation_frame_count"] = clips[0].frame_count
+                            info["dof_ids_decoded"] = clips[0].mapped
+                            info["needs_rig_bank"] = True
+                        rigamate = next((
+                            pointer for pointer in bank_pointers
+                            if "rigamate" in pointer.name.casefold()
+                        ), None)
+                        if rigamate is not None:
+                            info["rigamate_pointer"] = rigamate.name
+                            info["rigamate_key"] = rigamate.subject_key.hex()
+                            info["rigamate_external"] = rigamate.external
+                            if rigamate.external:
+                                self.after(
+                                    0, self.status_var.set,
+                                    f"Resolving {rigamate.name} key "
+                                    f"{rigamate.subject_key.hex()} across Anthem RES records…",
                                 )
-                                from .frostbite_animation_channels import analyze_quaternion_channel_health, format_channel_health_summary
-                                health = analyze_quaternion_channel_health(real_q, mapping, active["skeleton"])
-                                info["_playback_channels"] = real_q
-                                info["_playback_mapping"] = mapping
-                                info["_channel_health"] = health
-                                info["channel_health_summary"] = format_channel_health_summary(health)
+                                from .frostbite import resolve_frostbite_virtual_asset_key_isolated
+                                try:
+                                    engine_root = self.result.engine_root or self.result.root
+                                    cache_key = (str(engine_root.resolve()), rigamate.subject_key)
+                                    resolution = self._frostbite_virtual_asset_cache.get(cache_key)
+                                    if resolution is None:
+                                        resolution = resolve_frostbite_virtual_asset_key_isolated(
+                                            engine_root, asset, rigamate.subject_key,
+                                        )
+                                        self._frostbite_virtual_asset_cache[cache_key] = resolution
+                                    resolved, bank_raw, scanned, exhaustive = resolution
+                                    info["rigamate_scanned_records"] = scanned
+                                    info["rigamate_search_exhaustive"] = exhaustive
+                                    if resolved is not None and bank_raw is not None:
+                                        info["rigamate_resolved_asset"] = (
+                                            resolved.internal_path or resolved.relative_path
+                                        )
+                                        info["rigamate_resolved_bytes"] = len(bank_raw)
+                                        info["_rigamate_resolved_record"] = resolved
+                                        info["_rigamate_resolved_raw"] = bank_raw
+                                        if clip_options:
+                                            from .frostbite_rigamate import inspect_rigamate_dof_types
+                                            types = inspect_rigamate_dof_types(bank_raw, clips[0])
+                                            if types is not None:
+                                                info["rigamate_dof_types"] = (
+                                                    f"{len(types.joint_names)} named joints; "
+                                                    f"{len(types.quaternion_channel_ids)} rotation, "
+                                                    f"{len(types.vector_channel_ids)} position and "
+                                                    f"{len(types.float_channel_ids)} scalar DOF IDs verified"
+                                                )
+                                except MeshFormatError as error:
+                                    info["rigamate_resolution_error"] = str(error)
+                        if len(rig_keys) == 1 and clip_options:
+                            # The family-neutral, named DOF table is owned by
+                            # PrimaryRig.  EXM's smaller Rigamate resource also
+                            # happened to contain it, but EXF points Rigamate at
+                            # a curve bank with no joint names.  Resolve the
+                            # authored PrimaryRig key explicitly for every
+                            # Javelin family.
+                            primary_key = rig_keys[0]
+                            self.after(
+                                0, self.status_var.set,
+                                f"Resolving the authored PrimaryRig map {primary_key.hex()}…",
+                            )
+                            from .frostbite import resolve_frostbite_primary_rig_key_isolated
+                            try:
+                                engine_root = self.result.engine_root or self.result.root
+                                cache_key = (
+                                    str(engine_root.resolve()), primary_key, "primary-rig",
+                                )
+                                resolution = self._frostbite_virtual_asset_cache.get(cache_key)
+                                if resolution is None:
+                                    resolution = resolve_frostbite_primary_rig_key_isolated(
+                                        engine_root, asset, primary_key,
+                                    )
+                                    self._frostbite_virtual_asset_cache[cache_key] = resolution
+                                primary_asset, primary_raw, scanned, exhaustive = resolution
+                                info["primary_rig_scanned_records"] = scanned
+                                info["primary_rig_search_exhaustive"] = exhaustive
+                                if primary_asset is not None and primary_raw is not None:
+                                    info["primary_rig_resolved_asset"] = (
+                                        primary_asset.internal_path or primary_asset.relative_path
+                                    )
+                                    info["_primary_rig_resolved_record"] = primary_asset
+                                    info["_primary_rig_resolved_raw"] = primary_raw
+                            except MeshFormatError as error:
+                                info["primary_rig_resolution_error"] = str(error)
                 self.after(0, self._show_frostbite_animation_record, asset, title, info)
                 return
             if asset.metadata.get("reader") == "frostbite-skeleton-record":
@@ -1535,16 +2221,230 @@ class App(tk.Tk):
             self.after(0, self.preview_button.configure, {"state": "normal"})
 
     def _show_frostbite_animation_record(self, asset, title: str, info: dict[str, object]) -> None:
+        if "decoded_clip_count" in info:
+            asset.metadata["decoded_clip_count"] = int(info["decoded_clip_count"])
+            options = info.get("_animation_group_options") or []
+            asset.metadata["clip_names"] = tuple(
+                option["clip"].name for option in options
+                if isinstance(option, dict) and option.get("clip") is not None
+            )
+            self._update_animation_count_cell(asset)
+        self._animation_group_source = (asset, title, info)
         self._animation_playback = None
+        active_family = (self._active_character or {}).get("family")
+        asset_family = self._infer_character_family(asset.internal_path or asset.relative_path)
+        cache_family = asset_family or active_family
+        resolved_rigamate = info.get("_rigamate_resolved_record")
+        resolved_rigamate_raw = info.get("_rigamate_resolved_raw")
+        if resolved_rigamate is not None and isinstance(resolved_rigamate_raw, bytes):
+            self._resolved_rigamate_asset = resolved_rigamate
+            self._resolved_rigamate_raw = resolved_rigamate_raw
+            self.rigamate_extract_button.configure(state="normal")
+            if isinstance(cache_family, str):
+                self._rigamate_bank_cache[cache_family] = (resolved_rigamate, resolved_rigamate_raw)
+        else:
+            self._resolved_rigamate_asset = None
+            self._resolved_rigamate_raw = None
+            self.rigamate_extract_button.configure(state="disabled")
         compatibility, compatible = self._animation_compatibility(asset)
+        options = info.get("_animation_group_options") or []
+        selected_index = int(info.get("_animation_group_default_index", 0))
+        selected_clip = options[selected_index]["clip"] if 0 <= selected_index < len(options) else None
+        if selected_clip is not None:
+            for transient_key in (
+                "_playback_mapping", "_playback_channels", "_playback_vector_mapping",
+                "_playback_vector_channels", "_playback_skipped", "_playback_mapping_kind",
+                "_playback_default_rotations",
+                "_playback_transition_base_rotations",
+                "_helper_constants_held", "_external_channel_map", "_invalid_constants_held",
+                "_trajectory_translations_rebased", "_position_helpers_held",
+            ):
+                info.pop(transient_key, None)
+        candidate_bank_raw = resolved_rigamate_raw
+        if not isinstance(candidate_bank_raw, bytes) and isinstance(active_family, str):
+            cached_bank = self._rigamate_bank_cache.get(active_family)
+            if cached_bank is not None:
+                candidate_bank_raw = cached_bank[1]
+                info["_cached_rigamate_bank"] = True
+        mapping_bank_raw = info.get("_primary_rig_resolved_raw")
+        primary_rig_key = info.get("_primary_rig_key")
+        if (isinstance(cache_family, str) and isinstance(mapping_bank_raw, bytes)
+                and isinstance(primary_rig_key, bytes)):
+            primary_asset = info.get("_primary_rig_resolved_record")
+            self._primary_rig_bank_cache[cache_family] = (
+                primary_asset, mapping_bank_raw, primary_rig_key,
+            )
+        elif isinstance(active_family, str):
+            cached_primary = self._primary_rig_bank_cache.get(active_family)
+            if cached_primary is not None:
+                _primary_asset, mapping_bank_raw, primary_rig_key = cached_primary
+                info["_cached_primary_rig_bank"] = True
+        if not isinstance(mapping_bank_raw, bytes):
+            mapping_bank_raw = candidate_bank_raw
+        if (selected_clip is not None and not selected_clip.mapped
+                and selected_clip.channel_to_dof_key
+                and isinstance(candidate_bank_raw, bytes)):
+            from .frostbite_animation import resolve_clip_channel_map
+            selected_clip = resolve_clip_channel_map(selected_clip, candidate_bank_raw)
+            if selected_clip.mapped:
+                info["_external_channel_map"] = True
+        resolved_mapping = None
+        mapping_kind = ""
+        if (compatible is not False and selected_clip is not None
+                and isinstance(mapping_bank_raw, bytes) and self._active_character is not None
+                and self._active_character.get("family") in {"exm", "exf", "exh", "exl"}):
+            from dataclasses import replace
+            from .frostbite_animation import channel_map_candidates
+            from .frostbite_rigamate import decode_rigamate_bone_mapping
+            if selected_clip.mapped:
+                resolved_mapping = decode_rigamate_bone_mapping(
+                    mapping_bank_raw, selected_clip, self._active_character["skeleton"],
+                    expected_rig_key=primary_rig_key,
+                )
+                mapping_kind = "exact"
+            elif isinstance(candidate_bank_raw, bytes):
+                inferred = []
+                for dof_ids in channel_map_candidates(candidate_bank_raw, selected_clip.channel_count):
+                    candidate_clip = replace(selected_clip, dof_ids=dof_ids)
+                    candidate_mapping = decode_rigamate_bone_mapping(
+                        mapping_bank_raw, candidate_clip,
+                        self._active_character["skeleton"], include_constants=True,
+                        expected_rig_key=primary_rig_key,
+                    )
+                    if candidate_mapping is not None:
+                        score = (
+                            len(candidate_mapping.bone_indices)
+                            + len(candidate_mapping.vector_bone_indices),
+                            -len(candidate_mapping.skipped_names),
+                        )
+                        inferred.append((score, candidate_clip, candidate_mapping))
+                if inferred:
+                    inferred.sort(key=lambda item: item[0], reverse=True)
+                    _score, selected_clip, resolved_mapping = inferred[0]
+                    mapping_kind = "inferred bank"
+            if resolved_mapping is not None:
+                pose_mapping = []
+                pose_channels = []
+                pose_defaults = []
+                helper_constants_held = 0
+                invalid_constants_held = 0
+                for channel_index, bone_index, channel_name, default_rotation in zip(
+                    resolved_mapping.channel_indices,
+                    resolved_mapping.bone_indices,
+                    resolved_mapping.channel_names,
+                    resolved_mapping.default_rotations,
+                ):
+                    channel = selected_clip.quaternion_channels[channel_index]
+                    if not channel.decode_valid:
+                        invalid_constants_held += 1
+                        continue
+                    is_bad_rear_toe = (
+                        "toerear" in channel_name.casefold()
+                        and len(channel.values) == 1
+                        and abs(channel.values[0][3]) < 0.0001
+                        and abs(channel.values[0][0]) > 0.999
+                    )
+                    if is_bad_rear_toe:
+                        helper_constants_held += 1
+                        continue
+                    pose_mapping.append(bone_index)
+                    pose_channels.append(channel)
+                    pose_defaults.append(default_rotation)
+                info["_playback_mapping"] = pose_mapping
+                info["_playback_channels"] = pose_channels
+                info["_playback_default_rotations"] = pose_defaults
+                if self._prototype_running:
+                    from .interceptor_prototype import transition_base_clip_name
+                    base_name = transition_base_clip_name(selected_clip.name)
+                    base_clip = next((
+                        option["clip"] for option in options
+                        if (base_name is not None
+                            and option["clip"].name.casefold() == base_name.casefold())
+                    ), None)
+                    if base_clip is not None and base_clip.mapped:
+                        base_mapping = decode_rigamate_bone_mapping(
+                            mapping_bank_raw, base_clip,
+                            self._active_character["skeleton"], include_constants=True,
+                            expected_rig_key=primary_rig_key,
+                        )
+                        if base_mapping is not None:
+                            base_by_bone = {
+                                bone_index: base_clip.quaternion_channels[channel_index].values[-1]
+                                for channel_index, bone_index in zip(
+                                    base_mapping.channel_indices, base_mapping.bone_indices,
+                                )
+                                if (base_clip.quaternion_channels[channel_index].decode_valid
+                                    and base_clip.quaternion_channels[channel_index].values)
+                            }
+                            info["_playback_transition_base_rotations"] = [
+                                base_by_bone.get(bone_index) for bone_index in pose_mapping
+                            ]
+                from .frostbite_animation_playback import prepare_preview_translations
+                (
+                    preview_vector_mapping, preview_vector_channels,
+                    trajectory_rebased, position_helpers_held,
+                ) = prepare_preview_translations(
+                    list(resolved_mapping.vector_bone_indices),
+                    resolved_mapping.pose_vector_channels(selected_clip),
+                    list(resolved_mapping.vector_channel_names),
+                )
+                info["_playback_vector_mapping"] = preview_vector_mapping
+                info["_playback_vector_channels"] = preview_vector_channels
+                info["_trajectory_translations_rebased"] = trajectory_rebased
+                info["_position_helpers_held"] = position_helpers_held
+                info["_playback_skipped"] = len(resolved_mapping.skipped_names)
+                info["_playback_mapping_kind"] = mapping_kind
+                info["_helper_constants_held"] = helper_constants_held
+                info["_invalid_constants_held"] = invalid_constants_held
+        else:
+            info.pop("_playback_mapping", None)
+            info.pop("_playback_channels", None)
+            info.pop("_playback_missing_constants", None)
+        # Mapless clips remain testable through the decoded primary-rig order.
+        # This is a visible experimental fallback, never reported as exact.
+        if (compatible is not False and selected_clip is not None
+                and self._active_character is not None
+                and not info.get("_playback_mapping")
+                and self._active_character.get("family") == "exm"
+                and selected_clip.quaternion_channels):
+            from .frostbite_animation_playback import guess_bone_mapping
+            guessed = guess_bone_mapping(
+                self._active_character["skeleton"],
+                len(selected_clip.quaternion_channels),
+                self._active_character.get("primary_rig_order"),
+            )
+            count = min(len(guessed), len(selected_clip.quaternion_channels))
+            if count:
+                valid_pairs = [
+                    (bone_index, channel)
+                    for bone_index, channel in zip(
+                        guessed[:count], selected_clip.quaternion_channels[:count],
+                    )
+                    if channel.decode_valid
+                ]
+                info["_playback_mapping"] = [pair[0] for pair in valid_pairs]
+                info["_playback_channels"] = [pair[1] for pair in valid_pairs]
+                info["_playback_vector_mapping"] = []
+                info["_playback_vector_channels"] = []
+                invalid_constants_held = count - len(valid_pairs)
+                info["_playback_skipped"] = (
+                    len(selected_clip.quaternion_channels) - count + invalid_constants_held
+                )
+                info["_invalid_constants_held"] = invalid_constants_held
+                info["_playback_mapping_kind"] = "experimental primary-rig order"
         if self._active_character is not None:
-            self._show_active_character()
+            if not self._prototype_running:
+                self._show_active_character()
+            # During prototype state changes preserve the already displayed
+            # mesh. Reloading it for every selected clip wastes work, while
+            # clearing it here makes a valid active character disappear.
         else:
             self.viewer.clear(
                 "Animation record loaded\n\n"
                 "Preview a rigged Javelin mesh and enable Use for animation first."
             )
-        display_name = PurePosixPath(asset.internal_path or title).name
+        display_name = (selected_clip.name if selected_clip is not None
+                        else PurePosixPath(asset.internal_path or title).name)
         self.animation_clip_var.set(f"Animation: {display_name} · {compatibility}")
         kind = str(info.get("record_kind", "record")).upper()
         if "inspection_error" in info:
@@ -1554,15 +2454,21 @@ class App(tk.Tk):
                 f"EBX loaded: {int(info.get('imports', 0))} imports, "
                 f"{int(info.get('arrays', 0))} arrays"
             )
-        elif "quaternion_channel_count" in info:
-            structure = f"{kind} payload loaded, {info['quaternion_channel_count']} rotation channels decoded"
-            if "channel_health_summary" in info:
-                structure += f" ({info['channel_health_summary']})"
+        elif "decoded_clip_count" in info:
+            structure = (
+                f"{kind} payload loaded: {int(info['decoded_clip_count'])} clip(s), "
+                f"{int(info.get('animation_channel_count', 0))} curves and "
+                f"{int(info.get('quaternion_channel_count', 0))} rotation channels decoded"
+            )
         else:
             structure = f"{kind} payload loaded ({int(info.get('bytes', 0)):,} bytes)"
 
-        has_decoded_channels = "_playback_channels" in info and "_playback_mapping" in info
-        playback_ready = has_decoded_channels and self._active_character is not None and compatible is not False
+        has_decoded_channels = "decoded_clip_count" in info
+        has_exact_bone_mapping = bool(info.get("_playback_mapping"))
+        playback_ready = (
+            has_decoded_channels and has_exact_bone_mapping
+            and self._active_character is not None and compatible is not False
+        )
         if compatible is False:
             state = "Different Javelin family; playback remains disabled."
         elif self._active_character is None:
@@ -1572,24 +2478,90 @@ class App(tk.Tk):
                 state = "No active character bones matched this clip's channels; playback remains disabled."
             else:
                 state = "This isn't a decodable AntState animation payload; playback remains disabled."
+        elif not has_exact_bone_mapping:
+            rigamate_key = str(info.get("rigamate_key", ""))
+            resolved_bank = info.get("rigamate_resolved_asset")
+            scanned = int(info.get("rigamate_scanned_records", 0))
+            if resolved_bank:
+                verified = info.get("rigamate_dof_types")
+                state = (
+                    f"Rigamate key {rigamate_key} resolved to {resolved_bank} after scanning "
+                    f"{scanned:,} RES record(s). "
+                    + (f"EXM bank: {verified}. " if verified else "The bank payload is loaded. ")
+                    + "Channel types are confirmed, but the IDs still need a verified bone mapping before Play can be enabled."
+                )
+            elif info.get("rigamate_resolution_error"):
+                state = (
+                    f"Rigamate key {rigamate_key} was decoded, but its installation search failed safely: "
+                    f"{info['rigamate_resolution_error']}"
+                )
+            elif rigamate_key:
+                scope = "complete installation" if info.get("rigamate_search_exhaustive") else "bounded search"
+                state = (
+                    f"Rigamate key {rigamate_key} was decoded, but no defining RES was found in the "
+                    f"{scope} ({scanned:,} candidate record(s)). Playback remains disabled."
+                )
+            elif selected_clip is not None and not selected_clip.mapped:
+                state = (
+                    "Clip curves decoded, but this RES has no ChannelToDof IDs or Rigamate pointer. "
+                    "Bone mapping is needed before playback."
+                )
+            else:
+                state = (
+                    "Clip curves and ChannelToDof IDs decoded correctly. Playback is intentionally disabled until "
+                    "the referenced Rigamate animation bank supplies the exact DOF-to-bone mapping."
+                )
         else:
             self._active_animation = {
                 "channels": info["_playback_channels"],
                 "mapping": info["_playback_mapping"],
-                "guessed_channels": info["_playback_channels"],
-                "guessed_mapping": info["_playback_mapping"],
-                "guessed_health": info.get("_channel_health"),
                 "name": display_name,
                 "health": info.get("_channel_health"),
-                "external_bank_pointers": info.get("_external_bank_pointers") or [],
-                "group_option": (
-                    info["_animation_group_options"][info["_animation_group_default_index"]]
-                    if info.get("_animation_group_options") else None
+                "vector_mapping": info.get("_playback_vector_mapping", []),
+                "vector_channels": info.get("_playback_vector_channels", []),
+                "timeline_end": selected_clip.frame_count if selected_clip is not None else None,
+                "fps": selected_clip.fps if selected_clip is not None else 30.0,
+                "time_scale": selected_clip.time_scale if selected_clip is not None else 1.0,
+                "mapping_kind": info.get("_playback_mapping_kind", "exact"),
+                "default_rotations": info.get("_playback_default_rotations", []),
+                "transition_base_rotations": info.get(
+                    "_playback_transition_base_rotations", [],
                 ),
             }
-            state = (
-                f"{len(info['_playback_channels'])} rotation channels ready -- "
-                "bone mapping is a best guess, refine by eye once playing."
+            mapping_label = str(info.get("_playback_mapping_kind") or "exact")
+            if mapping_label != "exact":
+                state = (
+                    f"{len(info['_playback_channels'])} rotations ready with {mapping_label} mapping; "
+                    "the clip omitted its authored bone table, so verify the pose visually."
+                )
+            else:
+                state = (
+                    f"{len(info['_playback_channels'])} bank-mapped bone rotations ready; "
+                    f"{info.get('_playback_skipped', 0)} helper channels absent from the mesh skeleton skipped. "
+                    "Moving and constant rotations are decoded. "
+                    + ("Channel map resolved from the external bank. "
+                       if info.get("_external_channel_map") else "")
+                    + f"{len(info.get('_playback_vector_channels', []))} named translations applied."
+                )
+                if info.get("_helper_constants_held"):
+                    state += (
+                        f" {int(info['_helper_constants_held'])} degenerate rear-toe helper "
+                        "constant(s) held at bind pose."
+                    )
+                if info.get("_trajectory_translations_rebased"):
+                    state += (
+                        f" {int(info['_trajectory_translations_rebased'])} scene-space trajectory "
+                        "translation(s) recentered at the clip's first frame."
+                    )
+                if info.get("_position_helpers_held"):
+                    state += (
+                        f" {int(info['_position_helpers_held'])} controller-plane position "
+                        "helper(s) hidden from the preview skeleton."
+                    )
+        if info.get("_invalid_constants_held"):
+            state += (
+                f" {int(info['_invalid_constants_held'])} unverified packed constant(s) "
+                "held at bind pose."
             )
         if not playback_ready:
             self._active_animation = None
@@ -1597,33 +2569,73 @@ class App(tk.Tk):
         self.animation_play_button.configure(state="normal" if playback_ready else "disabled")
         self.animation_stop_button.configure(state="disabled")
         self.animation_dump_button.configure(state="normal" if playback_ready else "disabled")
-        self.animation_health_button.configure(state="normal" if playback_ready else "disabled")
+        self.animation_health_button.configure(state="normal" if playback_ready and info.get("_channel_health") else "disabled")
+        self.animation_video_button.configure(
+            state="normal" if playback_ready and not self._video_export_running else "disabled",
+        )
         self.animation_loop_checkbox.configure(state="normal" if playback_ready else "disabled")
-        self.animation_filter_checkbox.configure(state="normal" if playback_ready else "disabled")
+        self.animation_filter_checkbox.configure(state="normal" if playback_ready and info.get("_channel_health") else "disabled")
         group_options = info.get("_animation_group_options") or []
-        if playback_ready and len(group_options) > 1:
+        if group_options:
             self._animation_group_options = group_options
             self.animation_group_combo.configure(state="readonly", values=[g["label"] for g in group_options])
             default_index = int(info.get("_animation_group_default_index", 0))
             self.animation_group_combo.current(default_index)
+            self.animation_clip_position_var.set(f"{default_index + 1} / {len(group_options)}")
+            self.animation_previous_button.configure(state="normal" if default_index > 0 else "disabled")
+            self.animation_next_button.configure(
+                state="normal" if default_index + 1 < len(group_options) else "disabled",
+            )
+            self._update_clip_search_matches()
         else:
-            self._animation_group_options = group_options if playback_ready else []
+            self._animation_group_options = []
             self.animation_group_combo.configure(state="disabled", values=[])
             self.animation_group_var.set("")
-        external_pointers = (self._active_animation or {}).get("external_bank_pointers") or []
-        if external_pointers and not self._bank_search_running:
-            names = ", ".join(p.name for p in external_pointers)
-            self.bank_search_button.configure(state="normal", text=f"Find {names}…")
-        elif not self._bank_search_running:
-            self.bank_search_button.configure(state="disabled", text="Find external bank…")
-        group_option = (self._active_animation or {}).get("group_option") or {}
-        if self._loaded_banks and group_option.get("clip") is not None:
-            self.use_real_mapping_checkbox.configure(state="normal")
-        else:
-            self.use_real_mapping_var.set(False)
-            self.use_real_mapping_checkbox.configure(state="disabled")
+            self.animation_clip_position_var.set("0 / 0")
+            self.animation_previous_button.configure(state="disabled")
+            self.animation_next_button.configure(state="disabled")
+            self._update_clip_search_matches()
         self._update_animation_bar()
+        self._update_prototype_button()
         self.status_var.set(f"{structure}. {state}")
+
+    def _extract_resolved_rigamate_bank(self) -> None:
+        asset = self._resolved_rigamate_asset
+        raw = self._resolved_rigamate_raw
+        if asset is None or raw is None:
+            messagebox.showinfo(
+                "Rigamate bank unavailable",
+                "Preview an AntState animation and let its Rigamate dependency resolve first.",
+            )
+            return
+        destination = filedialog.askdirectory(title="Choose a folder for the resolved Rigamate bank")
+        if not destination:
+            return
+        try:
+            folder = Path(destination)
+            folder.mkdir(parents=True, exist_ok=True)
+            name = PurePosixPath(
+                asset.internal_path or "resolved_rigamate_bank.res"
+            ).name
+            output = folder / name
+            output.write_bytes(raw)
+            descriptor = output.with_name(output.name + ".json")
+            descriptor.write_text(
+                json.dumps(asset.to_dict(), indent=2), encoding="utf-8",
+            )
+        except (OSError, TypeError, ValueError) as error:
+            messagebox.showerror("Cannot extract Rigamate bank", str(error))
+            return
+        self.status_var.set(
+            f"Extracted resolved Rigamate bank {output.name} ({len(raw):,} bytes)."
+        )
+        messagebox.showinfo(
+            "Rigamate bank extracted",
+            f"Decoded the resolved bank to:\n{output}\n\n"
+            f"Also saved its archive descriptor:\n{descriptor.name}\n\n"
+            "Send both files back so the DOF-to-bone table can be decoded. "
+            "The original Anthem installation was not modified.",
+        )
 
     def _show_frostbite_preview(
         self, asset, meshes, lod_index: int, decoded_name: str,
@@ -1704,6 +2716,8 @@ class App(tk.Tk):
         self.viewer.set_detail_levels(
             available_lods, lod_index,
             lambda requested: self._request_frostbite_lod(asset, requested),
+            declared_lods=[int(value) for value in asset.metadata.get("declared_lods", [])],
+            related_assets=self._related_higher_detail_meshsets(asset, available_lods),
         )
         self.viewer.set_detail_loading(False)
         if len(available_lods) > 1:
@@ -1714,14 +2728,246 @@ class App(tk.Tk):
             )
         else:
             detail_message = f"Only the LOD{lod_index} geometry chunk is available in this bundle."
+        declared_lods = [int(value) for value in asset.metadata.get("declared_lods", [])]
+        if 0 in declared_lods and 0 not in available_lods:
+            present = ", ".join(f"LOD{value}" for value in sorted(available_lods))
+            detail_message += (
+                f" The MeshSet declares LOD0, but its chunk payload is absent from this "
+                f"installation (present: {present or 'none'})."
+            )
         skeleton_message = (
             f" Bind skeleton decoded: {len(skeleton.joints):,} bones; use Bones to toggle it."
             if skeleton is not None and skeleton_error is None
             else f" Bone overlay unavailable: {skeleton_error}" if skeleton_error else ""
         )
+        parts, common_lods, assembly_stem = self._multipart_meshset_group(asset)
+        if len(parts) >= 2 and common_lods:
+            self._assembly_source = (asset, common_lods)
+            self.assemble_button.configure(state="normal")
+            detail_message += (
+                f" Assemble cosmetics can combine the separate {assembly_stem} variant's "
+                f"{len(parts)} weighted body pieces at "
+                f"{', '.join(f'LOD{value}' for value in sorted(common_lods))}."
+            )
+        elif not asset.metadata.get("assembled_parts"):
+            self._assembly_source = None
+            self.assemble_button.configure(state="disabled")
         self.status_var.set(
             f"Previewing decoded Frostbite MeshSet {decoded_name} · LOD{lod_index}. "
             + detail_message + " " + summary + skeleton_message
+        )
+        if self._prototype_running:
+            self.viewer.bones_visible.set(False)
+        self._update_prototype_button()
+
+    def _related_higher_detail_meshsets(self, asset, available_lods: list[int]) -> list[str]:
+        """List installed sibling pieces that beat this MeshSet's best LOD.
+
+        Anthem's playable Javelins are assembled from arms/legs/torso/helmet
+        bitpacks. A monolithic preview MeshSet can therefore stop at LOD3 even
+        though higher-detail family pieces are installed elsewhere.
+        """
+        if self.result is None or not available_lods:
+            return []
+        internal = (asset.internal_path or "").replace("\\", "/").casefold()
+        match = re.search(r"(?:^|/)(exo/ex[a-z]_[^/]+)/", internal)
+        if match is None:
+            return []
+        family_root = match.group(1) + "/"
+        current_best = min(available_lods)
+        related: list[tuple[int, int, str]] = []
+        for candidate in self.result.assets:
+            candidate_internal = (candidate.internal_path or "").replace("\\", "/")
+            folded = candidate_internal.casefold()
+            if (candidate is asset or candidate.extension.casefold() != ".meshset"
+                    or family_root not in folded):
+                continue
+            candidate_lods = [int(value) for value in candidate.metadata.get("available_lods", [])]
+            if not candidate_lods or min(candidate_lods) >= current_best:
+                continue
+            best = min(candidate_lods)
+            base_priority = 0 if "/exm_lancer_base_" in ("/" + folded) else 1
+            related.append((best, base_priority, f"LOD{best}: {candidate_internal}"))
+        # Duplicate Data/Patch records have the same useful display name.
+        return list(dict.fromkeys(item[2] for item in sorted(related)))[:12]
+
+    @staticmethod
+    def _assembly_identity(asset) -> tuple[str, str, str | None] | None:
+        """Return (folder, variant stem, body part) for modular MeshSets."""
+        internal = (asset.internal_path or "").replace("\\", "/").casefold()
+        if not re.search(r"(?:^|/)exo/ex[a-z]_[^/]+/", internal):
+            return None
+        path = PurePosixPath(internal)
+        name = path.name.removesuffix(".meshset")
+        match = re.fullmatch(
+            r"(?P<stem>.+?)(?:_(?P<part>arms|legs|torso|helm|helmv2|helmet|head))?_model_mesh",
+            name,
+        )
+        if match is None:
+            return None
+        return str(path.parent), match.group("stem"), match.group("part")
+
+    def _multipart_meshset_group(self, asset):
+        """Find the best complete modular set in the selected Javelin folder.
+
+        Prefer the exact selected variant. A monolithic ``base`` MeshSet may
+        have no equally named pieces (notably Interceptor), so then choose the
+        locally installed complete cosmetic variant with the highest shared
+        detail. This reflects Anthem's runtime character construction: the
+        playable render model is assembled from customization slots.
+        """
+        identity = App._assembly_identity(asset)
+        if identity is None or self.result is None:
+            return [], [], ""
+        folder, selected_stem, _selected_part = identity
+        grouped = {}
+        for candidate in self.result.assets:
+            if candidate.extension.casefold() != ".meshset":
+                continue
+            candidate_identity = App._assembly_identity(candidate)
+            if candidate_identity is None:
+                continue
+            candidate_folder, candidate_stem, part = candidate_identity
+            lods = {int(value) for value in candidate.metadata.get("available_lods", [])}
+            if candidate_folder != folder or part is None or not lods:
+                continue
+            # Prefer patched records when Data and Patch expose the same path.
+            priority = 0 if candidate.relative_path.casefold().startswith("patch") else 1
+            by_part = grouped.setdefault(candidate_stem, {})
+            existing = by_part.get(part)
+            if existing is None or priority < existing[0]:
+                by_part[part] = (priority, candidate, lods)
+        choices = []
+        for candidate_stem, by_part in grouped.items():
+            if not {"legs", "torso", "arms"} <= by_part.keys():
+                continue
+            # Helmet variants are alternatives, not simultaneous layers.
+            names = ["legs", "torso", "arms"]
+            head = next((name for name in ("head", "helmet", "helm", "helmv2") if name in by_part), None)
+            if head is not None:
+                names.append(head)
+            ordered_parts = [by_part[name] for name in names]
+            common_lods = set.intersection(*(entry[2] for entry in ordered_parts))
+            if not common_lods:
+                continue
+            exact_priority = 0 if candidate_stem == selected_stem else 1
+            best_lod = min(common_lods)
+            choices.append((
+                exact_priority, best_lod, -len(ordered_parts), candidate_stem,
+                [entry[1] for entry in ordered_parts], sorted(common_lods, reverse=True),
+            ))
+        if not choices:
+            return [], [], selected_stem
+        _exact, _best, _count, stem, parts, common_lods = min(choices, key=lambda item: item[:4])
+        return parts, common_lods, stem
+
+    def _assemble_high_detail(self) -> None:
+        source = self._assembly_source
+        if source is None:
+            return
+        asset, common_lods = source
+        if not common_lods:
+            messagebox.showinfo(
+                "No common detail level",
+                "The matching body pieces do not share a locally stored LOD.",
+            )
+            return
+        self._request_frostbite_assembly(asset, min(common_lods))
+
+    def _request_frostbite_assembly(self, asset, lod_index: int) -> None:
+        if not self.result:
+            return
+        parts, common_lods, stem = self._multipart_meshset_group(asset)
+        if len(parts) < 2 or lod_index not in common_lods:
+            self._finish_frostbite_lod_error("No complete modular set exists at that LOD.")
+            return
+        self.preview_button.configure(state="disabled")
+        self.assemble_button.configure(state="disabled")
+        self.viewer.set_detail_loading(True)
+        self.status_var.set(
+            f"Assembling {len(parts)} matching body pieces at LOD{lod_index}…"
+        )
+        threading.Thread(
+            target=self._frostbite_assembly_worker,
+            args=(self.result.engine_root or self.result.root, asset, parts, common_lods, stem, lod_index),
+            daemon=True,
+        ).start()
+
+    def _frostbite_assembly_worker(
+        self, root: Path, source_asset, parts, common_lods: list[int], stem: str, lod_index: int,
+    ) -> None:
+        try:
+            from dataclasses import replace
+            from .frostbite import preview_frostbite_meshset_isolated
+            meshes = []
+            reports = []
+            for part in parts:
+                preview = preview_frostbite_meshset_isolated(root, part, lod_index=lod_index)
+                if preview[0] == "unavailable":
+                    raise MeshFormatError(str(preview[1]))
+                _kind, part_meshes, _lod, _name, _available, report = preview
+                meshes.extend(part_meshes)
+                reports.append(report)
+            skeleton, bind_rotations, primary_rig_order = self._decode_matching_frostbite_skeleton(source_asset)
+            sections = [section for report in reports for section in report.get("sections", [])]
+            bone_ids = sorted({
+                int(value) for report in reports
+                for value in report.get("skeleton_bone_ids", [])
+            })
+            weighted = sum(int(report.get("weighted_vertices", 0)) for report in reports)
+            total = sum(int(report.get("total_skin_vertices", 0)) for report in reports)
+            decoded_sections = sum(int(report.get("decoded_skin_sections", 0)) for report in reports)
+            candidate_sections = sum(int(report.get("candidate_skin_sections", 0)) for report in reports)
+            combined_report = {
+                "summary": (
+                    f"Assembled {len(parts)} modular pieces; {weighted:,}/{total:,} vertices weighted "
+                    f"across {decoded_sections}/{candidate_sections} skin sections."
+                ),
+                "likely_skinned": candidate_sections > 0,
+                "weights_decoded": decoded_sections > 0 and weighted > 0,
+                "decoded_skin_sections": decoded_sections,
+                "candidate_skin_sections": candidate_sections,
+                "weighted_vertices": weighted,
+                "total_skin_vertices": total,
+                "skeleton_bone_ids": bone_ids,
+                "sections": sections,
+            }
+            synthetic_path = f"{PurePosixPath(source_asset.internal_path or '').parent}/{stem}_assembled_model_mesh.meshset"
+            assembled_asset = replace(
+                source_asset, internal_path=synthetic_path,
+                metadata={
+                    **source_asset.metadata, "available_lods": common_lods,
+                    "declared_lods": common_lods, "assembled_parts": len(parts),
+                },
+            )
+            self.after(
+                0, self._show_frostbite_assembly, source_asset, assembled_asset, meshes,
+                lod_index, common_lods, combined_report, skeleton, bind_rotations,
+                primary_rig_order, len(parts), stem,
+            )
+        except Exception as error:
+            self.after(0, self._finish_frostbite_lod_error, str(error))
+        finally:
+            self.after(0, self.preview_button.configure, {"state": "normal"})
+
+    def _show_frostbite_assembly(
+        self, source_asset, assembled_asset, meshes, lod_index: int, common_lods: list[int],
+        report, skeleton, bind_rotations, primary_rig_order, part_count: int, stem: str,
+    ) -> None:
+        self._show_frostbite_preview(
+            assembled_asset, meshes, lod_index, f"{stem} assembled ({part_count} pieces)",
+            common_lods, report, skeleton, None, bind_rotations, primary_rig_order,
+        )
+        self._assembly_source = (source_asset, common_lods)
+        self.assemble_button.configure(state="normal")
+        self.viewer.set_detail_levels(
+            common_lods, lod_index,
+            lambda requested: self._request_frostbite_assembly(source_asset, requested),
+            declared_lods=common_lods,
+        )
+        self.status_var.set(
+            f"Assembled {part_count} matching {stem} pieces at LOD{lod_index}. "
+            "The Detail slider now switches the complete modular set."
         )
 
     def _infer_character_family(self, internal_path: str) -> str | None:

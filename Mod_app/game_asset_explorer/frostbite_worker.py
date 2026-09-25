@@ -7,8 +7,9 @@ import sys
 from pathlib import Path
 
 from .frostbite_index import (
-    extract_frostbite_ebx_dependencies, extract_frostbite_record,
+    count_frostbite_animation_records, extract_frostbite_ebx_dependencies, extract_frostbite_record,
     inspect_frostbite_meshsets, preview_frostbite_meshset,
+    resolve_frostbite_virtual_asset_key,
 )
 from .geometry import MeshFormatError
 from .models import AssetRecord
@@ -75,6 +76,12 @@ def main() -> int:
                 "data": base64.b64encode(raw).decode("ascii"),
                 "size": len(raw),
             }
+        elif action == "count_animation_clips":
+            assets = [_asset(dict(item)) for item in request.get("assets", [])]
+            response = {
+                "kind": "animation_clip_counts",
+                "counts": count_frostbite_animation_records(root, assets),
+            }
         elif action == "extract_record_dependencies":
             asset = _asset(dict(request["asset"]))
             raw, dependencies = extract_frostbite_ebx_dependencies(root, asset)
@@ -90,6 +97,39 @@ def main() -> int:
                     }
                     for linked, linked_raw in dependencies
                 ],
+            }
+        elif action == "resolve_virtual_asset_key":
+            asset = _asset(dict(request["asset"]))
+            key = bytes.fromhex(str(request["key"]))
+            resolved, raw, scanned, exhaustive = resolve_frostbite_virtual_asset_key(
+                root, asset, key,
+            )
+            response = {
+                "kind": "virtual_asset_resolution",
+                "key": key.hex(),
+                "scanned_records": scanned,
+                "exhaustive": exhaustive,
+                "asset": resolved.to_dict() if resolved is not None else None,
+                "data": base64.b64encode(raw).decode("ascii") if raw is not None else None,
+                "size": len(raw) if raw is not None else 0,
+            }
+        elif action == "resolve_primary_rig_key":
+            asset = _asset(dict(request["asset"]))
+            key = bytes.fromhex(str(request["key"]))
+            resolved, raw, scanned, exhaustive = resolve_frostbite_virtual_asset_key(
+                root, asset, key,
+            )
+            if raw is not None:
+                from .frostbite_rigamate import extract_rigamate_mapping_bank
+                raw = extract_rigamate_mapping_bank(raw, key)
+            response = {
+                "kind": "primary_rig_resolution",
+                "key": key.hex(),
+                "scanned_records": scanned,
+                "exhaustive": exhaustive,
+                "asset": resolved.to_dict() if resolved is not None and raw is not None else None,
+                "data": base64.b64encode(raw).decode("ascii") if raw is not None else None,
+                "size": len(raw) if raw is not None else 0,
             }
         else:
             raise ValueError("Unknown Frostbite worker action.")

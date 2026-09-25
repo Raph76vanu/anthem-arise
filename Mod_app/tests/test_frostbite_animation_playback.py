@@ -3,9 +3,11 @@ from __future__ import annotations
 import math
 import unittest
 
+from game_asset_explorer.frostbite_animation import VectorChannel
 from game_asset_explorer.frostbite_animation_channels import QuaternionChannel
 from game_asset_explorer.frostbite_animation_playback import (
-    axis_angle_to_quaternion, evaluate_pose, guess_bone_mapping,
+    axis_angle_to_quaternion, evaluate_pose, evaluate_pose_transforms, guess_bone_mapping,
+    compose_transition_loop_channels, prepare_preview_translations,
     quaternion_angle_degrees, quaternion_multiply, quaternion_rotate_vector,
 )
 from game_asset_explorer.geometry import SkeletonData
@@ -96,6 +98,126 @@ class BindPoseReconstructionTests(unittest.TestCase):
         identity = (0.0, 0.0, 0.0, 1.0)
         pose = evaluate_pose(skeleton, [identity, identity], [], [], 0.0)
         self.assertEqual(pose.joints[1][2:5], (0.0, 1.0, 0.0))
+
+    def test_diagnostic_rotation_rules_differ_without_changing_default_playback(self) -> None:
+        from game_asset_explorer.frostbite_animation import QuaternionChannel as EclipseChannel
+
+        bind = axis_angle_to_quaternion((0.0, 0.0, 1.0), math.pi / 2)
+        animated = axis_angle_to_quaternion((1.0, 0.0, 0.0), math.pi / 2)
+        skeleton = SkeletonData("toy", [
+            ("Root", -1, 0.0, 0.0, 0.0),
+            ("Elbow", 0, 1.0, 0.0, 0.0),
+            ("Hand", 1, 1.0, 1.0, 0.0),
+        ])
+        rotations = [(0.0, 0.0, 0.0, 1.0), bind, (0.0, 0.0, 0.0, 1.0)]
+        channels = [EclipseChannel((0, 1), (animated, animated))]
+        default = evaluate_pose_transforms(skeleton, rotations, [1], channels, 0.5)[0]
+        before = evaluate_pose_transforms(
+            skeleton, rotations, [1], channels, 0.5, rotation_mode="delta_bind",
+        )[0]
+        self.assertNotEqual(default.joints[2][2:], before.joints[2][2:])
+        self.assertEqual(default.joints[2][2:],
+                         evaluate_pose_transforms(skeleton, rotations, [1], channels, 0.5)[0].joints[2][2:])
+
+    def test_absolute_mode_replaces_animated_local_bind_rotation(self) -> None:
+        from game_asset_explorer.frostbite_animation import QuaternionChannel as EclipseChannel
+
+        bind = axis_angle_to_quaternion((0.0, 0.0, 1.0), math.pi / 2)
+        animated = axis_angle_to_quaternion((1.0, 0.0, 0.0), math.pi / 2)
+        skeleton = SkeletonData("toy", [
+            ("Root", -1, 0.0, 0.0, 0.0),
+            ("Elbow", 0, 1.0, 0.0, 0.0),
+            ("Hand", 1, 1.0, 1.0, 0.0),
+        ])
+        rotations = [(0.0, 0.0, 0.0, 1.0), bind, (0.0, 0.0, 0.0, 1.0)]
+        channels = [EclipseChannel((0,), (animated,))]
+        pose, world = evaluate_pose_transforms(
+            skeleton, rotations, [1], channels, 0.0, rotation_mode="absolute",
+        )
+        self.assertAlmostEqual(world[1][0], animated[0])
+        self.assertAlmostEqual(world[1][3], animated[3])
+        self.assertAlmostEqual(pose.joints[2][2], 2.0)
+        self.assertAlmostEqual(pose.joints[2][3], 0.0, places=6)
+        self.assertAlmostEqual(pose.joints[2][4], 0.0, places=6)
+
+    def test_absolute_vector_channel_replaces_joint_local_offset(self) -> None:
+        from game_asset_explorer.frostbite_animation import VectorChannel
+
+        skeleton = SkeletonData("toy", [
+            ("Root", -1, 0.0, 0.0, 0.0),
+            ("Hips", 0, 0.0, 1.0, 0.0),
+            ("Knee", 1, 0.0, 2.0, 0.0),
+        ])
+        identity = [(0.0, 0.0, 0.0, 1.0)] * 3
+        translation = VectorChannel((0,), ((0.25, 0.5, -0.25),))
+        pose, _ = evaluate_pose_transforms(
+            skeleton, identity, [], [], 0.0,
+            vector_mapping=[1], vector_channels=[translation],
+        )
+        self.assertEqual(pose.joints[1][2:], (0.25, 0.5, -0.25))
+        self.assertEqual(pose.joints[2][2:], (0.25, 1.5, -0.25))
+
+
+class PreviewTranslationTests(unittest.TestCase):
+    def test_rebases_scene_root_and_hides_controller_plane(self) -> None:
+        trajectory = VectorChannel(
+            (0, 10), ((0.0, 0.0, 5.855), (1.0, 0.0, 7.0)),
+        )
+        ground = VectorChannel((0,), ((-6.03, 0.0, 0.0),))
+        hips = VectorChannel((0,), ((0.0, 1.2, 0.0),))
+        mapping, channels, rebased, held = prepare_preview_translations(
+            [1, 8, 10], [trajectory, ground, hips],
+            ["AITrajectory.t", "GroundPlane.t", "Hips.t"],
+        )
+        self.assertEqual(mapping, [1, 8, 10])
+        self.assertEqual(channels[0].values[0], (0.0, 0.0, 0.0))
+        self.assertEqual(channels[0].values[1][:2], (1.0, 0.0))
+        self.assertAlmostEqual(channels[0].values[1][2], 1.145)
+        self.assertEqual(channels[1], ground)
+        self.assertEqual(channels[2], hips)
+        self.assertEqual((rebased, held), (1, 1))
+
+
+class RigamateDeltaCompositionTests(unittest.TestCase):
+    def test_composes_default_before_delta_without_changing_timing(self) -> None:
+        from game_asset_explorer.frostbite_animation import QuaternionChannel as EclipseChannel
+
+        default = axis_angle_to_quaternion((0.0, 0.0, 1.0), math.pi / 2)
+        delta = axis_angle_to_quaternion((1.0, 0.0, 0.0), math.pi / 2)
+        identity = (0.0, 0.0, 0.0, 1.0)
+        channel = EclipseChannel((0, 7), (identity, delta), b"constant", ((1, 2, 3),))
+        composed = compose_transition_loop_channels([channel], [default])[0]
+        expected = quaternion_multiply(default, delta)
+        self.assertEqual(composed.times, channel.times)
+        self.assertEqual(composed.constant_encoding, channel.constant_encoding)
+        self.assertEqual(composed.packed_words, channel.packed_words)
+        for actual, wanted in zip(composed.values[1], expected):
+            self.assertAlmostEqual(actual, wanted)
+
+    def test_rejects_shifted_default_table(self) -> None:
+        with self.assertRaises(ValueError):
+            compose_transition_loop_channels([], [(0.0, 0.0, 0.0, 1.0)])
+
+    def test_missing_base_keeps_channel_unchanged(self) -> None:
+        from game_asset_explorer.frostbite_animation import QuaternionChannel as EclipseChannel
+
+        channel = EclipseChannel((0,), ((0.0, 0.0, 0.0, 1.0),))
+        self.assertIs(compose_transition_loop_channels([channel], [None])[0], channel)
+
+    def test_nonidentity_first_frame_is_removed_before_loop_motion(self) -> None:
+        from game_asset_explorer.frostbite_animation import QuaternionChannel as EclipseChannel
+
+        reference = axis_angle_to_quaternion((0.0, 1.0, 0.0), math.pi / 3)
+        motion = axis_angle_to_quaternion((1.0, 0.0, 0.0), math.pi / 8)
+        second = quaternion_multiply(reference, motion)
+        base = axis_angle_to_quaternion((0.0, 0.0, 1.0), math.pi / 4)
+        channel = EclipseChannel((0, 1), (reference, second))
+        result = compose_transition_loop_channels([channel], [base])[0]
+        for actual, wanted in zip(result.values[0], base):
+            self.assertAlmostEqual(actual, wanted)
+        expected = quaternion_multiply(base, motion)
+        for actual, wanted in zip(result.values[1], expected):
+            self.assertAlmostEqual(actual, wanted)
 
 
 class BoneMappingTests(unittest.TestCase):

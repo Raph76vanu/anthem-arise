@@ -396,6 +396,12 @@ def decode_anthem_skeleton_bind_rotations(raw: bytes) -> list[tuple[float, float
 
     rotations = []
     for matrix in local_pose:
-        rotation_3x3 = (matrix[0], matrix[1], matrix[2], matrix[4], matrix[5], matrix[6], matrix[8], matrix[9], matrix[10])
+        # The EBX transforms store column vectors in successive groups of
+        # four, with translation in slots 12..14.  The converter accepts
+        # row-major entries; feeding it the groups directly produces the
+        # inverse of each joint's local bind rotation.
+        rotation_3x3 = (matrix[0], matrix[4], matrix[8],
+                        matrix[1], matrix[5], matrix[9],
+                        matrix[2], matrix[6], matrix[10])
         rotations.append(_rotation_matrix_to_quaternion(rotation_3x3))
     return rotations

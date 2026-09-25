@@ -13,7 +13,9 @@ from statistics import median
 
 from PIL import Image, ImageDraw, ImageFont
 
-from .frostbite_animation import QuaternionChannel, decode_anthem_animation_stream
+from .frostbite_animation import (
+    QuaternionChannel, decode_anthem_animation_stream, resolve_clip_channel_map,
+)
 from .frostbite_animation_playback import (
     IDENTITY_QUATERNION, evaluate_pose_transforms, quaternion_multiply, quaternion_slerp,
 )
@@ -30,7 +32,8 @@ class Hypothesis:
 
 
 HYPOTHESES = (
-    Hypothesis("current"),
+    Hypothesis("current_absolute", rotation_mode="absolute", source="raw"),
+    Hypothesis("former_bank_delta"),
     Hypothesis("old_xyz_decoder", source="old_xyz"),
     Hypothesis("delta_before_bind", rotation_mode="delta_bind"),
     Hypothesis("raw_as_delta", source="raw"),
@@ -103,24 +106,34 @@ def _channels(clip, mapping, hypothesis: Hypothesis) -> list[QuaternionChannel]:
         for index, default in zip(mapping.channel_indices, mapping.default_rotations):
             source = clip.quaternion_channels[index]
             values = []
-            for words in source.packed_words:
-                xyz = tuple((word - 32768.0) / 32767.0 for word in words)
-                w = sqrt(max(0.0, 1.0 - sum(x * x for x in xyz)))
-                norm = sqrt(sum(x * x for x in xyz) + w * w)
-                values.append(tuple(x / norm for x in (*xyz, w)))
+            if source.constant_encoding:
+                values.extend(source.values)
+            else:
+                for words in source.packed_words:
+                    xyz = tuple((word - 32768.0) / 32767.0 for word in words)
+                    w = sqrt(max(0.0, 1.0 - sum(x * x for x in xyz)))
+                    norm = sqrt(sum(x * x for x in xyz) + w * w)
+                    values.append(tuple(x / norm for x in (*xyz, w)))
             channels.append(QuaternionChannel(source.times, tuple(
                 quaternion_multiply(_conjugate(default), value) for value in values
             )))
         return channels
     if hypothesis.source == "bank_delta":
-        return mapping.pose_channels(clip)
+        channels = []
+        for index, default in zip(mapping.channel_indices, mapping.default_rotations):
+            inverse = _conjugate(default)
+            source = clip.quaternion_channels[index]
+            channels.append(QuaternionChannel(source.times, tuple(
+                quaternion_multiply(inverse, value) for value in source.values
+            )))
+        return channels
     if hypothesis.source == "half_delta":
         return [QuaternionChannel(ch.times, tuple(quaternion_slerp(IDENTITY_QUATERNION, q, 0.5)
                                                  for q in ch.values))
-                for ch in mapping.pose_channels(clip)]
+                for ch in _channels(clip, mapping, Hypothesis("bank_delta"))]
     if hypothesis.source == "inverse_delta":
         return [QuaternionChannel(ch.times, tuple(_conjugate(q) for q in ch.values))
-                for ch in mapping.pose_channels(clip)]
+                for ch in _channels(clip, mapping, Hypothesis("bank_delta"))]
     sources = [clip.quaternion_channels[i] for i in mapping.channel_indices]
     if hypothesis.source == "raw":
         return sources
@@ -203,9 +216,10 @@ def diagnose(res_path: Path, skeleton_path: Path, bank_path: Path, output: Path)
     results: list[dict] = []
     raw_validity: list[tuple[str, int, int]] = []
     for clip_number, clip in enumerate(clips, 1):
+        clip = resolve_clip_channel_map(clip, bank)
         invalid, total = invalid_component_counts(clip)
         raw_validity.append((clip.name, invalid, total))
-        mapping = decode_rigamate_bone_mapping(bank, clip, skeleton)
+        mapping = decode_rigamate_bone_mapping(bank, clip, skeleton, include_constants=True)
         if mapping is None:
             raise ValueError(f"No named EXM bone mapping for clip {clip_number}: {clip.name}")
         all_poses: list[list[SkeletonData]] = []
@@ -215,6 +229,9 @@ def diagnose(res_path: Path, skeleton_path: Path, bank_path: Path, output: Path)
                 return evaluate_pose_transforms(
                     skeleton, bind_rotations, list(mapping.bone_indices), channels, phase,
                     rotation_mode=mode.rotation_mode,
+                    vector_mapping=list(mapping.vector_bone_indices),
+                    vector_channels=mapping.pose_vector_channels(clip),
+                    timeline_end=clip.frame_count,
                 )[0]
             pictures = [evaluate(phase) for phase in PHASES]
             all_poses.append(pictures)

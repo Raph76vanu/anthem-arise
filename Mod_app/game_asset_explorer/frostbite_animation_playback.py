@@ -1,4 +1,10 @@
-"""Turn decoded animation channels (frostbite_animation_channels.py) into an
+"""Legacy experimental pose evaluator retained for regression comparison.
+
+The GUI no longer enables this guessed-mapping path. Anthem's ChannelToDof IDs
+require the referenced Rigamate bank, and the dynamic rotations are compressed
+quaternions rather than the Euler values accepted here.
+
+Turn decoded animation channels (frostbite_animation_channels.py) into an
 actual animated skeleton pose, using a best-guess channel-to-bone mapping.
 
 This module is deliberately upfront about what is proven versus guessed:
@@ -43,12 +49,51 @@ you fix by eye far faster than by reading more bytes.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .frostbite_animation_channels import ChannelHealth, FloatChannel, QuaternionChannel, VectorChannel
 from .geometry import SkeletonData
 
 HELPER_KEYWORDS = ("camera", "trajectory", "ground", "connect", "climb", "ai", "reference")
+
+
+def prepare_preview_translations(
+    bone_mapping: list[int], channels: list[VectorChannel], channel_names: list[str],
+) -> tuple[list[int], list[VectorChannel], int, int]:
+    """Rebase scene roots and omit non-render plane helpers in previews.
+
+    Some Anthem locomotion clips store an absolute scene placement on their
+    trajectory root. Subtracting its first sample keeps every displacement
+    within the clip while starting the viewer at its own origin. Ground and
+    climb planes drive gameplay controllers, not skinned geometry: keep their
+    authored channels intact for runtime research, while reporting them so the
+    viewer can hide only their overlay points and lines.
+    """
+    prepared_mapping: list[int] = []
+    prepared_channels: list[VectorChannel] = []
+    rebased = 0
+    helpers_hidden = 0
+    for bone_index, channel, channel_name in zip(bone_mapping, channels, channel_names):
+        joint_name = channel_name.rsplit(".", 1)[0].casefold()
+        if joint_name in {"groundplane", "climbplane"}:
+            helpers_hidden += 1
+        if joint_name in {"reference", "aitrajectory", "trajectory"} and channel.values:
+            origin_index = (
+                min(range(len(channel.times)), key=channel.times.__getitem__)
+                if len(channel.times) == len(channel.values) else 0
+            )
+            origin = channel.values[origin_index]
+            channel = replace(
+                channel,
+                values=tuple(
+                    (value[0] - origin[0], value[1] - origin[1], value[2] - origin[2])
+                    for value in channel.values
+                ),
+            )
+            rebased += 1
+        prepared_mapping.append(bone_index)
+        prepared_channels.append(channel)
+    return prepared_mapping, prepared_channels, rebased, helpers_hidden
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +114,34 @@ def quaternion_multiply(a: Quaternion, b: Quaternion) -> Quaternion:
         aw * bz + ax * by - ay * bx + az * bw,
         aw * bw - ax * bx - ay * by - az * bz,
     )
+
+
+def compose_transition_loop_channels(channels, base_rotations):
+    """Anchor loop motion to the final pose of its authored transition.
+
+    For every channel this evaluates ``base * inverse(loop[0]) * loop[t]``.
+    It therefore handles both identity-centred Glide deltas and Hover curves
+    carrying a non-identity local reference. Constant loop channels become
+    the transition endpoint exactly. Composition is done once when a clip is
+    selected, not once per rendered frame. A missing base entry keeps that
+    channel unchanged rather than guessing.
+    """
+    if len(channels) != len(base_rotations):
+        raise ValueError("Base rotations must align one-to-one with animation channels.")
+    return [
+        replace(channel, values=tuple(
+            quaternion_multiply(
+                quaternion_multiply(
+                    base_rotation,
+                    (-channel.values[0][0], -channel.values[0][1],
+                     -channel.values[0][2], channel.values[0][3]),
+                ),
+                value,
+            )
+            for value in channel.values
+        )) if base_rotation is not None and channel.values else channel
+        for channel, base_rotation in zip(channels, base_rotations)
+    ]
 
 
 def quaternion_rotate_vector(q: Quaternion, v: tuple[float, float, float]) -> tuple[float, float, float]:
@@ -132,34 +205,34 @@ def _bracket(times: tuple[int, ...], t: float):
     return order[-1], order[-1], 0.0
 
 
-def _channel_local_time(times: tuple[int, ...], phase: float) -> float:
-    """Map a normalized loop phase [0, 1] to this channel's own time range.
+def _channel_local_time(
+    times: tuple[int, ...], phase: float, timeline_end: int | None = None,
+) -> float:
+    """Map loop phase to the shared clip clock, or a legacy local clock.
 
-    Channels have wildly different observed max times (confirmed on real
-    data: from a few hundred to 65535), which is expected if a channel
-    simply stops needing new keyframes once its value settles -- but it
-    means sharing one global absolute time across all channels makes any
-    channel with a small range freeze for almost the entire loop the
-    moment its own last keyframe passes, while a few outlier channels
-    dominate the loop length. Normalizing per-channel avoids that; the
-    trade-off is that channels meant to stay exactly in sync with very
-    different individual ranges may drift slightly out of sync with each
-    other. Not proven optimal, just clearly better than freezing.
+    Eclipse key times within one clip share a timeline. Channels with an
+    earlier final key deliberately hold that value while other channels keep
+    moving. ``timeline_end`` is supplied by mapped Eclipse playback; the local
+    fallback is retained for the older standalone AntState diagnostics.
     """
     if not times:
         return 0.0
+    if timeline_end is not None and timeline_end > 0:
+        return phase * timeline_end
     lo, hi = min(times), max(times)
     return lo + phase * (hi - lo)
 
 
-def sample_float_channel(channel: FloatChannel, phase: float) -> float:
-    t = _channel_local_time(channel.times, phase)
+def sample_float_channel(channel: FloatChannel, phase: float, timeline_end: int | None = None) -> float:
+    t = _channel_local_time(channel.times, phase, timeline_end)
     i0, i1, blend = _bracket(channel.times, t)
     return channel.values[i0] + (channel.values[i1] - channel.values[i0]) * blend
 
 
-def sample_vector_channel(channel: VectorChannel, phase: float) -> tuple[float, float, float]:
-    t = _channel_local_time(channel.times, phase)
+def sample_vector_channel(
+    channel: VectorChannel, phase: float, timeline_end: int | None = None,
+) -> tuple[float, float, float]:
+    t = _channel_local_time(channel.times, phase, timeline_end)
     i0, i1, blend = _bracket(channel.times, t)
     v0, v1 = channel.values[i0], channel.values[i1]
     return tuple(v0[axis] + (v1[axis] - v0[axis]) * blend for axis in range(3))
@@ -206,8 +279,20 @@ def _unwrap_component(raw: int, reference: int, period: int = 65536) -> int:
     return min(candidates, key=lambda c: abs(c - reference))
 
 
-def sample_quaternion_channel(channel: QuaternionChannel, phase: float) -> Quaternion:
-    t = _channel_local_time(channel.times, phase)
+def sample_quaternion_channel(
+    channel: QuaternionChannel, phase: float, timeline_end: int | None = None,
+) -> Quaternion:
+    # Frostbite's EclipseAnimationAsset reader has already reconstructed its
+    # quantized quaternion components. The older low-level AntState inspector
+    # exposes raw Euler-like words instead; both paths share pose evaluation.
+    decoded_values = getattr(channel, "values", None)
+    if decoded_values is not None:
+        if not channel.times or len(decoded_values) != len(channel.times):
+            return IDENTITY_QUATERNION
+        t = _channel_local_time(channel.times, phase, timeline_end)
+        i0, i1, blend = _bracket(channel.times, t)
+        return quaternion_slerp(decoded_values[i0], decoded_values[i1], blend)
+    t = _channel_local_time(channel.times, phase, timeline_end)
     i0, i1, blend = _bracket(channel.times, t)
     raw0 = channel.raw_xyz[i0]
     if i0 == i1:
@@ -286,35 +371,34 @@ def filter_healthy_channels(
 # Pose evaluation (forward kinematics from bind-pose positions).
 # ---------------------------------------------------------------------------
 
-def evaluate_pose(
+def evaluate_pose_transforms(
     skeleton: SkeletonData,
     bind_rotations: list[Quaternion],
     bone_mapping: list[int],
     quaternion_channels: list[QuaternionChannel],
     phase: float,
-) -> SkeletonData:
+    *,
+    rotation_mode: str = "bind_delta",
+    vector_mapping: list[int] | None = None,
+    vector_channels: list[VectorChannel] | None = None,
+    timeline_end: int | None = None,
+) -> tuple[SkeletonData, tuple[Quaternion, ...]]:
     """Produce a new SkeletonData with world-space joint positions at a
     normalized point in the loop, phase in [0, 1].
 
-    phase is mapped to each channel's OWN time range independently (see
-    _channel_local_time) rather than one shared absolute time, since
-    channels have very different observed max times and sharing one
-    timeline made short-range channels freeze for most of the loop.
+    Mapped Eclipse playback supplies the clip's shared final tick. Channels
+    whose last authored key is earlier hold that value for the rest of the
+    clip, preserving synchronization between rotations and translations.
 
     bind_rotations (from frostbite_ebx.decode_anthem_skeleton_bind_rotations,
     same order as skeleton.joints) is each joint's LOCAL rest orientation
-    relative to its parent. This matters because animation channels give a
-    rotation relative to that rest orientation, not relative to global
-    identity -- a joint whose rest pose is far from identity (confirmed:
-    arm bones in this rig have a real ~46 degree bind rotation, consistent
-    with a T-pose bind skeleton) would otherwise visibly snap toward
-    identity instead of its natural pose. For an animated joint the local
-    rotation is bind_rotation * channel_rotation (composed, not replaced);
-    for a non-animated joint it's just bind_rotation (not identity).
-    UNVERIFIED: whether channel data is truly a delta relative to bind
-    (assumed here) versus something else -- this is the next thing to
-    confirm visually.
+    relative to its parent. Unanimated joints retain that rotation. Eclipse
+    channels resolved through Rigamate are stored as absolute local rotations,
+    so their playback caller selects ``rotation_mode="absolute"``. The two
+    delta modes remain available for diagnostics and legacy callers.
     """
+    if rotation_mode not in {"bind_delta", "delta_bind", "absolute"}:
+        raise ValueError(f"Unknown rotation mode: {rotation_mode}")
     joints = skeleton.joints
 
     # Precompute each joint's ACCUMULATED bind-pose world rotation (root to
@@ -360,6 +444,11 @@ def evaluate_pose(
         for channel_index, joint_index in enumerate(bone_mapping)
         if channel_index < len(quaternion_channels)
     }
+    vector_for_joint: dict[int, VectorChannel] = {
+        joint_index: vector_channels[channel_index]
+        for channel_index, joint_index in enumerate(vector_mapping or [])
+        if vector_channels is not None and channel_index < len(vector_channels)
+    }
 
     world_rotation: list[Quaternion] = [IDENTITY_QUATERNION] * len(joints)
     world_position: list[tuple[float, float, float]] = [(0.0, 0.0, 0.0)] * len(joints)
@@ -368,9 +457,20 @@ def evaluate_pose(
         bind_rotation = bind_rotations[index] if index < len(bind_rotations) else IDENTITY_QUATERNION
         channel = channel_for_joint.get(index)
         if channel is not None:
-            local_rotation = quaternion_multiply(bind_rotation, sample_quaternion_channel(channel, phase))
+            animated_rotation = sample_quaternion_channel(channel, phase, timeline_end)
+            if rotation_mode == "absolute":
+                local_rotation = animated_rotation
+            elif rotation_mode == "delta_bind":
+                local_rotation = quaternion_multiply(animated_rotation, bind_rotation)
+            else:
+                local_rotation = quaternion_multiply(bind_rotation, animated_rotation)
         else:
             local_rotation = bind_rotation
+        vector_channel = vector_for_joint.get(index)
+        local_offset = (
+            sample_vector_channel(vector_channel, phase, timeline_end)
+            if vector_channel is not None else bind_local_offset[index]
+        )
 
         if 0 <= parent < len(joints) and parent < index:
             parent_rotation = world_rotation[parent]
@@ -380,7 +480,7 @@ def evaluate_pose(
             parent_position = (0.0, 0.0, 0.0)
 
         this_rotation = quaternion_multiply(parent_rotation, local_rotation)
-        rotated_offset = quaternion_rotate_vector(parent_rotation, bind_local_offset[index])
+        rotated_offset = quaternion_rotate_vector(parent_rotation, local_offset)
         this_position = (
             parent_position[0] + rotated_offset[0],
             parent_position[1] + rotated_offset[1],
@@ -393,7 +493,18 @@ def evaluate_pose(
         (joint[0], joint[1], *world_position[index])
         for index, joint in enumerate(joints)
     ]
-    return SkeletonData(skeleton.name, new_joints)
+    return SkeletonData(skeleton.name, new_joints), tuple(world_rotation)
+
+
+def evaluate_pose(
+    skeleton: SkeletonData,
+    bind_rotations: list[Quaternion],
+    bone_mapping: list[int],
+    quaternion_channels: list[QuaternionChannel],
+    phase: float,
+) -> SkeletonData:
+    """Return the posed bone positions; see evaluate_pose_transforms for skinning."""
+    return evaluate_pose_transforms(skeleton, bind_rotations, bone_mapping, quaternion_channels, phase)[0]
 
 
 def quaternion_angle_degrees(q: Quaternion) -> float:
@@ -448,6 +559,11 @@ def describe_pose_debug(
     bone_mapping: list[int],
     quaternion_channels: list[QuaternionChannel],
     phase: float,
+    *,
+    rotation_mode: str = "bind_delta",
+    vector_mapping: list[int] | None = None,
+    vector_channels: list[VectorChannel] | None = None,
+    timeline_end: int | None = None,
 ) -> list[JointPoseDebug]:
     """Per-joint diagnostic snapshot at a given phase: which channel (if
     any) drives this joint, its bind rotation, the channel's own rotation
@@ -463,7 +579,12 @@ def describe_pose_debug(
         for channel_index, joint_index in enumerate(bone_mapping)
         if channel_index < len(quaternion_channels)
     }
-    pose = evaluate_pose(skeleton, bind_rotations, bone_mapping, quaternion_channels, phase)
+    pose, _ = evaluate_pose_transforms(
+        skeleton, bind_rotations, bone_mapping, quaternion_channels, phase,
+        rotation_mode=rotation_mode,
+        vector_mapping=vector_mapping, vector_channels=vector_channels,
+        timeline_end=timeline_end,
+    )
 
     def relative_angle_deg(a: Quaternion, b: Quaternion) -> float:
         ax, ay, az, aw = a
@@ -476,16 +597,22 @@ def describe_pose_debug(
         bind_rotation = bind_rotations[index] if index < len(bind_rotations) else IDENTITY_QUATERNION
         entry = channel_for_joint.get(index)
         channel_index = entry[0] if entry else None
-        channel_key_count = entry[1].key_count if entry else None
+        channel_key_count = (getattr(entry[1], "key_count", len(entry[1].times))
+                             if entry else None)
         channel_angle_deg = None
         sway_deg = None
         if entry is not None:
             channel = entry[1]
-            channel_rotation_now = sample_quaternion_channel(channel, phase)
-            channel_rotation_start = sample_quaternion_channel(channel, 0.0)
+            channel_rotation_now = sample_quaternion_channel(channel, phase, timeline_end)
+            channel_rotation_start = sample_quaternion_channel(channel, 0.0, timeline_end)
             channel_angle_deg = quaternion_angle_degrees(channel_rotation_now)
             sway_deg = relative_angle_deg(channel_rotation_start, channel_rotation_now)
-            local_rotation = quaternion_multiply(bind_rotation, channel_rotation_now)
+            if rotation_mode == "absolute":
+                local_rotation = channel_rotation_now
+            elif rotation_mode == "delta_bind":
+                local_rotation = quaternion_multiply(channel_rotation_now, bind_rotation)
+            else:
+                local_rotation = quaternion_multiply(bind_rotation, channel_rotation_now)
         else:
             local_rotation = bind_rotation
         records.append(JointPoseDebug(
